@@ -1,0 +1,147 @@
+name: Build OpenWrt for GL-BE14000
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: Publish the image as a GitHub release
+        type: boolean
+        default: true
+  schedule:
+    - cron: '0 3 * * 0'
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: https://github.com/JiaY-shi/openwrt.git
+  UPSTREAM_BRANCH: flint4-support
+  PANEL_FEED: https://github.com/blogic/feed-blogic.git
+  PANEL_LUCI: https://github.com/Beaverfffan/glinet-panel.git
+
+jobs:
+  build:
+    name: GL-BE14000 (mediatek/filogic)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync \
+            unzip zlib1g-dev file wget device-tree-compiler swig time
+
+      - name: Clone OpenWrt tree
+        run: |
+          git clone --depth 1 -b "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" openwrt
+          cd openwrt
+          echo "BASELINE=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "::notice title=Baseline::$(git log -1 --oneline)"
+
+      - name: Add blogic feed for the TFT panel
+        run: |
+          cd openwrt
+          echo "src-git blogic $PANEL_FEED" >> feeds.conf.default
+          git clone --depth 1 "$PANEL_LUCI" /tmp/glinet-panel
+          cp -r /tmp/glinet-panel/luci-app-glinet-panel package/
+          cat feeds.conf.default
+
+      - name: Update and install feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Seed target configuration
+        run: |
+          cd openwrt
+          cp ../ci/config/be14000.config .config
+          make defconfig
+
+      - name: Verify configuration
+        run: |
+          cd openwrt
+          for opt in \
+            CONFIG_TARGET_mediatek=y \
+            CONFIG_TARGET_mediatek_filogic=y \
+            CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_glinet_gl-be14000=y \
+            CONFIG_PACKAGE_luci=y \
+            CONFIG_PACKAGE_glinet-panel-ui=y
+          do
+            if grep -qx "$opt" .config; then
+              echo "ok   $opt"
+            else
+              echo "FAIL $opt is missing from .config"
+              exit 1
+            fi
+          done
+          if grep -qx 'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_glinet_gl-be14000-ubootmod=y' .config; then
+            echo "FAIL the ubootmod variant is selected - it replaces the vendor bootloader"
+            exit 1
+          fi
+          echo "configuration looks sane"
+
+      - name: Download sources
+        run: |
+          cd openwrt
+          make download -j$(nproc)
+
+      - name: Compile firmware
+        run: |
+          cd openwrt
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Collect images
+        id: collect
+        run: |
+          cd openwrt/bin/targets/mediatek/filogic
+          ls -lh
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp -v *glinet_gl-be14000*.bin "$GITHUB_WORKSPACE/out/" || true
+          cp -v sha256sums "$GITHUB_WORKSPACE/out/" || true
+          echo "stamp=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl-be14000-${{ steps.collect.outputs.stamp }}
+          path: out/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.event_name == 'schedule' || inputs.create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: auto-${{ steps.collect.outputs.stamp }}-${{ env.BASELINE }}
+          name: GL-BE14000 ${{ steps.collect.outputs.stamp }}
+          body: |
+            Automated OpenWrt build for the GL.iNet Flint 4 (GL-BE14000).
+
+            Source: `JiaY-shi/openwrt` @ `flint4-support`, commit `${{ env.BASELINE }}`
+            Panel UI: `blogic/feed-blogic` + `Beaverfffan/glinet-panel`
+
+            Flash `*-squashfs-factory.bin` from the GL.iNet U-Boot web recovery.
+            Use `*-squashfs-sysupgrade.bin` for later upgrades from LuCI.
+
+            Unofficial build. No warranty. Verify the recovery procedure before flashing.
+          files: out/*
+          fail_on_unmatched_files: true
