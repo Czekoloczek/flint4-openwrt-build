@@ -28,13 +28,19 @@ jobs:
       - name: Maximize build space
         uses: easimon/maximize-build-space@v10
         with:
-          root-reserve-mb: 2048
-          swap-size-mb: 2048
+          root-reserve-mb: 10240
+          swap-size-mb: 1024
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
           remove-codeql: 'true'
           remove-docker-images: 'true'
+
+      - name: Report available space
+        run: |
+          echo "### disk after maximize-build-space" >> "$GITHUB_STEP_SUMMARY"
+          df -h / /home/runner/work >> "$GITHUB_STEP_SUMMARY"
+          df -h / /home/runner/work
 
       - name: Checkout this repository
         uses: actions/checkout@v4
@@ -103,11 +109,16 @@ jobs:
         run: |
           cd openwrt
           make download -j$(nproc)
+          df -h / /home/runner/work
 
       - name: Compile firmware
         run: |
           cd openwrt
           make -j$(nproc) || make -j1 V=s
+
+      - name: Report space after build
+        if: always()
+        run: df -h / /home/runner/work
 
       - name: Collect images
         id: collect
