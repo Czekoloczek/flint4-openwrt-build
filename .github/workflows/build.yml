@@ -165,6 +165,7 @@ jobs:
             CONFIG_PACKAGE_nlbwmon=y \
             CONFIG_PACKAGE_kmod-nf-conntrack-netlink=y \
             CONFIG_PACKAGE_luci-theme-material=y \
+            CONFIG_LUCI_LANG_pl=y \
             CONFIG_PACKAGE_luci-i18n-base-pl=y
           do
             if grep -qx "$opt" .config; then
