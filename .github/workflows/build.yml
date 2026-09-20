@@ -217,7 +217,7 @@ jobs:
           fi
           for pkg in luci-app-glinet-panel glinet-panel-ui ucode-mod-lvgl \
                      glinet-panel-firmware kmod-hwmon-pwmfan luci \
-                     adguardhome nlbwmon luci-theme-material luci-i18n-base-pl; do
+                     adguardhome nlbwmon vnstat2 luci-theme-material luci-i18n-base-pl; do
             if grep -q "^${pkg} " "$m"; then
               echo "ok   $pkg"
             else
