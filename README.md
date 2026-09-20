@@ -20,14 +20,24 @@ the RTL8261C 10G PHY, the PWM fan and the TFT panel drivers.
 
 ## Running it
 
-Trigger **Build OpenWrt for GL-BE14000** from the Actions tab, or wait for the weekly
-Sunday run. A full build takes roughly 100–170 minutes on a standard 4 vCPU runner.
+The workflow runs in two jobs.
+
+**`check`** resolves the upstream branch head with `git ls-remote` and looks for a release
+tagged with that commit. If one exists, the build is skipped. It costs a few seconds.
+
+**`build`** only runs when `check` says the upstream moved. A full build takes roughly
+100–170 minutes on a standard 4 vCPU runner.
+
+The schedule fires **every 4 hours**, so a new upstream commit is picked up the same day
+without rebuilding the same source over and over. Manual runs from the Actions tab default
+to `force`, which builds regardless — use that after changing anything in this repository,
+since the check only looks at upstream.
 
 > This repository must stay **public**. Public repositories get 4 vCPU / 16 GB runners;
 > private ones get 2 vCPU / 8 GB, which pushes the build close to the 6 hour job limit.
 
 > GitHub disables scheduled workflows after 60 days without repository activity.
-> Trigger a manual run occasionally if the weekly build goes quiet.
+> The 4-hourly `check` job counts, so this should not go quiet on its own.
 
 ## Output
 

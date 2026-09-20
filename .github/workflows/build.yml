@@ -7,8 +7,12 @@ on:
         description: Publish the image as a GitHub release
         type: boolean
         default: true
+      force:
+        description: Build even if upstream has not moved
+        type: boolean
+        default: true
   schedule:
-    - cron: '0 3 * * 0'
+    - cron: '0 */4 * * *'
 
 permissions:
   contents: write
@@ -20,8 +24,53 @@ env:
   PANEL_LUCI: https://github.com/Beaverfffan/glinet-panel.git
 
 jobs:
+  check:
+    name: Check upstream
+    runs-on: ubuntu-22.04
+    outputs:
+      sha: ${{ steps.probe.outputs.sha }}
+      short: ${{ steps.probe.outputs.short }}
+      should_build: ${{ steps.probe.outputs.should_build }}
+    steps:
+      - name: Probe upstream head and existing releases
+        id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git ls-remote "$UPSTREAM_REPO" "refs/heads/$UPSTREAM_BRANCH" | cut -f1)
+          if [ -z "$sha" ]; then
+            echo "could not resolve $UPSTREAM_BRANCH on $UPSTREAM_REPO"
+            exit 1
+          fi
+          short=${sha:0:7}
+          echo "sha=$sha"     >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ inputs.force }}" = "true" ]; then
+            reason="manual run with force"
+            build=true
+          elif gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+               --json tagName --jq '.[].tagName' | grep -q -- "-${short}$"; then
+            reason="a release for ${short} already exists"
+            build=false
+          else
+            reason="no release for ${short} yet"
+            build=true
+          fi
+
+          echo "should_build=$build" >> "$GITHUB_OUTPUT"
+          {
+            echo "### upstream check"
+            echo ""
+            echo "- branch: \`$UPSTREAM_BRANCH\` at \`$short\`"
+            echo "- decision: **$( [ "$build" = true ] && echo build || echo skip )** — $reason"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$reason -> build=$build"
+
   build:
     name: GL-BE14000 (mediatek/filogic)
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-22.04
 
     steps:
@@ -58,13 +107,15 @@ jobs:
           sudo apt-get install -y \
             build-essential clang flex bison gawk gcc-multilib g++-multilib \
             gettext git libncurses-dev libssl-dev python3-setuptools rsync \
-            unzip zlib1g-dev file wget device-tree-compiler swig time
+            unzip zlib1g-dev file wget device-tree-compiler swig time ccache
 
-      - name: Clone OpenWrt tree
+      - name: Clone OpenWrt tree at the checked commit
         run: |
-          git clone --depth 1 -b "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" openwrt
-          cd openwrt
-          echo "BASELINE=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          mkdir openwrt && cd openwrt
+          git init -q
+          git remote add origin "$UPSTREAM_REPO"
+          git fetch -q --depth 1 origin "${{ needs.check.outputs.sha }}"
+          git checkout -q FETCH_HEAD
           echo "::notice title=Baseline::$(git log -1 --oneline)"
 
       - name: Add blogic feed for the TFT panel
@@ -166,9 +217,9 @@ jobs:
           done
           {
             echo "### packages in image"
-            echo "\`\`\`"
-            wc -l < "$m" | tr -d '\n'; echo " packages total"
-            echo "\`\`\`"
+            echo '```'
+            echo "$(wc -l < "$m") packages total"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload build artifacts
@@ -183,12 +234,12 @@ jobs:
         if: github.event_name == 'schedule' || inputs.create_release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: auto-${{ steps.collect.outputs.stamp }}-${{ env.BASELINE }}
+          tag_name: auto-${{ steps.collect.outputs.stamp }}-${{ needs.check.outputs.short }}
           name: GL-BE14000 ${{ steps.collect.outputs.stamp }}
           body: |
             Automated OpenWrt build for the GL.iNet Flint 4 (GL-BE14000).
 
-            Source: `JiaY-shi/openwrt` @ `flint4-support`, commit `${{ env.BASELINE }}`
+            Source: `JiaY-shi/openwrt` @ `flint4-support`, commit `${{ needs.check.outputs.short }}`
             Panel UI: `blogic/feed-blogic` + `Beaverfffan/glinet-panel`
 
             Flash `*-squashfs-factory.bin` from the GL.iNet U-Boot web recovery.
