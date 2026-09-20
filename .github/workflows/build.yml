@@ -131,6 +131,9 @@ jobs:
           cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          sed -i '/^src-git blogic /d' feeds.conf.default
+          echo "blogic dropped from feeds.conf.default after install:"
+          cat feeds.conf.default
 
       - name: Restore ccache
         uses: actions/cache@v4
@@ -221,6 +224,22 @@ jobs:
             echo "$(wc -l < "$m") packages total"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Confirm blogic is not a runtime repository
+        run: |
+          cd openwrt
+          f=$(find build_dir -path '*/root-mediatek/etc/apk/repositories.d/*' -name '*.list' 2>/dev/null | head -1)
+          if [ -z "$f" ]; then
+            echo "no repositories.d list found in the staged rootfs - skipping"
+            exit 0
+          fi
+          echo "runtime repositories:"
+          cat "$f"
+          if grep -q blogic "$f"; then
+            echo "FAIL blogic is listed as a runtime repo - apk update will break on the missing index"
+            exit 1
+          fi
+          echo "ok   blogic is build-time only"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
