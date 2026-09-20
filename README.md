@@ -10,78 +10,126 @@ This repository holds only the workflow and the target configuration — no sour
 | | |
 |---|---|
 | Source tree | [`JiaY-shi/openwrt`](https://github.com/JiaY-shi/openwrt) @ `flint4-support` |
-| Target | `mediatek/filogic`, device `glinet_gl-be14000` |
-| Panel UI | [`blogic/feed-blogic`](https://github.com/blogic/feed-blogic) (`glinet-panel-ui`, ucode + LVGL) |
-| Panel control | [`Beaverfffan/glinet-panel`](https://github.com/Beaverfffan/glinet-panel) (`luci-app-glinet-panel`) |
+| Target | `mediatek/filogic`, device `glinet_gl-be14000` (**not** the `-ubootmod` variant) |
+| Panel UI | [`blogic/feed-blogic`](https://github.com/blogic/feed-blogic) — `glinet-panel-ui`, ucode + LVGL |
+| Panel control | [`Beaverfffan/glinet-panel`](https://github.com/Beaverfffan/glinet-panel) — `luci-app-glinet-panel` |
 
 The `flint4-support` branch carries John Crispin's board support completed by JiaY-shi:
-the Motorcomm YT921x/YT922x DSA stack, the quad 2.5GbE PHY driver, MT7996 Wi-Fi with WED,
-the RTL8261C 10G PHY, the PWM fan and the TFT panel drivers.
+the Motorcomm YT921x/YT922x DSA stack, the YT8824 quad 2.5GbE PHY, MT7996 Wi-Fi with WED,
+the RTL8261C 10G PHY, plus the PWM fan, backlight and touchscreen drivers.
 
-## Running it
+### In the image
 
-The workflow runs in two jobs.
+LuCI with `luci-ssl`, the Material theme, the dashboard module and Polish translations.
+AdGuard Home, nlbwmon, `kmod-sfp` for the SFP+ cage, and the full panel stack.
 
-**`check`** resolves the upstream branch head with `git ls-remote` and looks for a release
-tagged with that commit. If one exists, the build is skipped. It costs a few seconds.
+Anything that needs a kernel module **must be added here** — `kmod-*` packages from the
+official snapshot feed do not match this build's kernel and will refuse to install.
 
-**`build`** only runs when `check` says the upstream moved. A full build takes roughly
-100–170 minutes on a standard 4 vCPU runner.
+## Installing
 
-The schedule fires **every 4 hours**, so a new upstream commit is picked up the same day
-without rebuilding the same source over and over. Manual runs from the Actions tab default
-to `force`, which builds regardless — use that after changing anything in this repository,
-since the check only looks at upstream.
+> ### `*-squashfs-factory.bin` does not work. Use the sysupgrade image.
+>
+> Both documented paths reject the factory image, because it carries **no OpenWrt metadata**:
+>
+> | Path | Result |
+> |---|---|
+> | GL.iNet U-Boot web recovery | `UPDATE FAILED — Probably you have chosen wrong file` |
+> | GL.iNet admin panel → local upgrade | `Firmware not compatible`, verification failed |
+>
+> ```
+> IMAGE/factory.bin    := append-kernel | pad-to 32M | append-rootfs   # no metadata
+> IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata             # has metadata
+> ```
+>
+> This is not a vendor signature check. GL.iNet's stock firmware **is** OpenWrt (21.02) with a
+> standard `sysupgrade`, `fwtool` and `usign`, so it accepts a sysupgrade image whose
+> `supported_devices` matches the board.
+
+From the stock GL.iNet firmware, over SSH — **on a wired connection**:
+
+```sh
+# on your computer; -O is required, Dropbear has no sftp-server
+scp -O openwrt-*-squashfs-sysupgrade.bin root@192.168.8.1:/tmp/
+
+# on the router
+sha256sum /tmp/openwrt-*-squashfs-sysupgrade.bin          # compare with sha256sums
+cat /tmp/sysinfo/board_name                                # must be glinet,gl-be14000
+sysupgrade -T /tmp/openwrt-*-squashfs-sysupgrade.bin       # verify, writes nothing
+sysupgrade -n /tmp/openwrt-*-squashfs-sysupgrade.bin       # flash, does not keep config
+```
+
+The SSH session drops mid-flash — that is expected. Wait 3–5 minutes and do not cut power.
+OpenWrt comes up on `192.168.1.1` with an empty root password.
+
+`sysupgrade -T` genuinely validates the image. A file that is not a sysupgrade image returns
+exit 1 with `Image metadata not present`, so a silent exit 0 means the image is good.
+
+### Going back to stock
+
+The vendor bootloader is untouched, so the U-Boot web recovery always works — it just will not
+take an OpenWrt image. Hold **Reset** while powering on until the screen shows a countdown, set
+your computer to `192.168.1.2/24`, open `http://192.168.1.1` and upload GL.iNet's own firmware.
+
+## Running the workflow
+
+Two jobs. **`check`** resolves the upstream head with `git ls-remote` and looks for a release
+tagged with that commit; if one exists the build is skipped. It costs seconds and runs
+**every 4 hours**, which also keeps the schedule from being disabled for inactivity.
+
+**`build`** only runs when upstream moved. Manual runs default to `force`, which builds
+regardless — use that after changing anything in this repository, since `check` only looks
+upstream.
+
+A full build takes roughly **2.5–3.5 hours** on a standard 4 vCPU runner. Most of the tail is
+the Go toolchain, which the buildroot compiles from scratch to produce AdGuard Home. ccache is
+enabled and cuts later runs.
 
 > This repository must stay **public**. Public repositories get 4 vCPU / 16 GB runners;
 > private ones get 2 vCPU / 8 GB, which pushes the build close to the 6 hour job limit.
 
-> GitHub disables scheduled workflows after 60 days without repository activity.
-> The 4-hourly `check` job counts, so this should not go quiet on its own.
-
-## Output
-
-Two images land in `bin/targets/mediatek/filogic/` and are published as a release:
-
-- `*-squashfs-factory.bin` — flash this from the GL.iNet U-Boot web recovery
-- `*-squashfs-sysupgrade.bin` — for later upgrades from LuCI
-
-## Flashing
-
-1. Back up the stock configuration and **download the stock GL.iNet firmware first** —
-   that is the way back.
-2. Power the router off. Hold **Reset**, power on, keep holding until the screen shows
-   a countdown.
-3. Set your computer to **192.168.1.2/24**, open **http://192.168.1.1**.
-4. Upload the `factory.bin`. Wait about 3 minutes. Do not cut power.
-
-The vendor bootloader is left alone, so the same recovery path restores the stock firmware.
-
-The build deliberately selects the plain `glinet_gl-be14000` profile, **not** the
-`-ubootmod` variant — that one replaces the vendor bootloader and removes the web recovery.
-The workflow fails the build if the wrong variant ends up selected.
+The workflow fails the build if the configuration or the resulting image is missing anything it
+should contain, if the `-ubootmod` variant gets selected, or if the blogic feed ends up as a
+runtime APK repository — that last one breaks `apk update`, because blogic hosts no
+`packages.adb` index.
 
 ## After first boot
 
-OpenWrt comes up on `192.168.1.1` with an empty root password and the radios disabled.
-Set a password, then configure the network. Note that the package manager is `apk`,
-not `opkg` — OpenWrt switched with 25.12.
+The package manager is `apk`, not `opkg` — OpenWrt switched with 25.12.
 
-Attended Sysupgrade and `owut` will not work here: they request images from OpenWrt's
-build server, which does not know this device. Upgrades stay manual.
+Attended Sysupgrade and `owut` do **not** work here: they request images from OpenWrt's build
+server, which does not know this device. Upgrades stay manual.
+
+### 6 GHz needs a PSC channel
+
+`channel='auto'` lets ACS pick any channel, and clients only scan the **Preferred Scanning
+Channels** — 5, 21, 37, 53, 69, 85 and so on. On a non-PSC channel the radio is up and
+correctly configured but effectively invisible. Set one explicitly:
+
+```sh
+uci set wireless.radio2.channel='37'   # 6135 MHz, fits a 320 MHz block
+uci set wireless.default_radio0.rnr='1'
+uci set wireless.default_radio1.rnr='1'
+uci commit wireless && wifi reload
+```
+
+`rnr=1` makes the 2.4 and 5 GHz beacons advertise the co-located 6 GHz AP.
+
+### iwinfo is unreliable on MT7996
+
+Three radios share one `phy0`. `iwinfo` reports `Channel: 0 (unknown GHz)` for the 6 GHz radio
+and lists 2.4 GHz frequencies for it. Use `iw dev phy0.2-ap0 info` instead.
 
 ## Configuration
 
-Edit [`config/be14000.config`](config/be14000.config) and re-run the workflow.
-It is a seed fed to `make defconfig`, so it only needs the options that differ
-from the target defaults.
-
-`kmod-sfp` is included so the 10G SFP+ cage works; the device tree declares the cage but
-`CONFIG_SFP` is not built into the target. Drop it if you have no use for that port.
+Edit [`config/be14000.config`](config/be14000.config) and re-run the workflow with `force`.
+It is a seed fed to `make defconfig`, so it only needs options that differ from the defaults.
 
 ## Credits
 
 Board support by [John Crispin](https://github.com/blogic) and
-[JiaY-shi](https://github.com/JiaY-shi). Panel UI by John Crispin.
-LuCI panel control by [Beaverfffan](https://github.com/Beaverfffan).
+[JiaY-shi](https://github.com/JiaY-shi). Panel UI by John Crispin. LuCI panel control by
+[Beaverfffan](https://github.com/Beaverfffan). Prior art and the runtime-feed fix from
+[DiGz-Au/Flint4-build](https://github.com/DiGz-Au/Flint4-build) and
+[akorshun/openwrt](https://github.com/akorshun/openwrt).
 This repository only automates the build.
