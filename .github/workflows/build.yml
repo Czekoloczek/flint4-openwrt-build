@@ -160,7 +160,12 @@ jobs:
             CONFIG_PACKAGE_glinet-panel-ui=y \
             CONFIG_PACKAGE_luci-app-glinet-panel=y \
             CONFIG_PACKAGE_ucode-mod-lvgl=y \
-            CONFIG_PACKAGE_kmod-hwmon-pwmfan=y
+            CONFIG_PACKAGE_kmod-hwmon-pwmfan=y \
+            CONFIG_PACKAGE_adguardhome=y \
+            CONFIG_PACKAGE_nlbwmon=y \
+            CONFIG_PACKAGE_kmod-nf-conntrack-netlink=y \
+            CONFIG_PACKAGE_luci-theme-material=y \
+            CONFIG_PACKAGE_luci-i18n-base-pl=y
           do
             if grep -qx "$opt" .config; then
               echo "ok   $opt"
@@ -210,7 +215,8 @@ jobs:
             exit 0
           fi
           for pkg in luci-app-glinet-panel glinet-panel-ui ucode-mod-lvgl \
-                     glinet-panel-firmware kmod-hwmon-pwmfan luci; do
+                     glinet-panel-firmware kmod-hwmon-pwmfan luci \
+                     adguardhome nlbwmon luci-theme-material luci-i18n-base-pl; do
             if grep -q "^${pkg} " "$m"; then
               echo "ok   $pkg"
             else
