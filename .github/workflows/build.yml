@@ -30,6 +30,7 @@ jobs:
     outputs:
       sha: ${{ steps.probe.outputs.sha }}
       short: ${{ steps.probe.outputs.short }}
+      self: ${{ steps.probe.outputs.self }}
       should_build: ${{ steps.probe.outputs.should_build }}
     steps:
       - name: Probe upstream head and existing releases
@@ -43,18 +44,20 @@ jobs:
             exit 1
           fi
           short=${sha:0:7}
+          self=$(echo "$GITHUB_SHA" | cut -c1-7)
           echo "sha=$sha"     >> "$GITHUB_OUTPUT"
           echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "self=$self"   >> "$GITHUB_OUTPUT"
 
           if [ "${{ inputs.force }}" = "true" ]; then
             reason="manual run with force"
             build=true
           elif gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
-               --json tagName --jq '.[].tagName' | grep -q -- "-${short}$"; then
-            reason="a release for ${short} already exists"
+               --json tagName --jq '.[].tagName' | grep -q -- "-${short}-${self}$"; then
+            reason="a release for upstream ${short} built from ${self} already exists"
             build=false
           else
-            reason="no release for ${short} yet"
+            reason="no release for upstream ${short} built from ${self} yet"
             build=true
           fi
 
@@ -62,7 +65,8 @@ jobs:
           {
             echo "### upstream check"
             echo ""
-            echo "- branch: \`$UPSTREAM_BRANCH\` at \`$short\`"
+            echo "- upstream: \`$UPSTREAM_BRANCH\` at \`$short\`"
+            echo "- this repository: \`$self\`"
             echo "- decision: **$( [ "$build" = true ] && echo build || echo skip )** — $reason"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "$reason -> build=$build"
@@ -260,12 +264,13 @@ jobs:
         if: github.event_name == 'schedule' || inputs.create_release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: auto-${{ steps.collect.outputs.stamp }}-${{ needs.check.outputs.short }}
+          tag_name: auto-${{ steps.collect.outputs.stamp }}-${{ needs.check.outputs.short }}-${{ needs.check.outputs.self }}
           name: GL-BE14000 ${{ steps.collect.outputs.stamp }}
           body: |
             Automated OpenWrt build for the GL.iNet Flint 4 (GL-BE14000).
 
             Source: `JiaY-shi/openwrt` @ `flint4-support`, commit `${{ needs.check.outputs.short }}`
+            Built from this repository at `${{ needs.check.outputs.self }}`
             Panel UI: `blogic/feed-blogic` + `Beaverfffan/glinet-panel`
 
             Flash `*-squashfs-factory.bin` from the GL.iNet U-Boot web recovery.

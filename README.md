@@ -73,13 +73,21 @@ your computer to `192.168.1.2/24`, open `http://192.168.1.1` and upload GL.iNet'
 
 ## Running the workflow
 
-Two jobs. **`check`** resolves the upstream head with `git ls-remote` and looks for a release
-tagged with that commit; if one exists the build is skipped. It costs seconds and runs
-**every 4 hours**, which also keeps the schedule from being disabled for inactivity.
+Two jobs. **`check`** resolves the upstream head with `git ls-remote`, takes this repository's
+own commit, and looks for a release tagged `auto-<stamp>-<upstream>-<repo>`. If that exact pair
+already has a release the build is skipped; **a change on either side triggers a rebuild**. It
+costs seconds and runs **every 4 hours**, which also keeps the schedule from being disabled for
+inactivity.
 
-**`build`** only runs when upstream moved. Manual runs default to `force`, which builds
-regardless — use that after changing anything in this repository, since `check` only looks
-upstream.
+| upstream | this repo | release for the pair | decision |
+|---|---|---|---|
+| unchanged | unchanged | exists | skip |
+| changed | unchanged | missing | build |
+| unchanged | changed | missing | build |
+| changed | changed | missing | build |
+
+**`build`** only runs when `check` says so. Manual runs default to `force`, which builds
+regardless.
 
 A full build takes roughly **2.5–3.5 hours** on a standard 4 vCPU runner. Most of the tail is
 the Go toolchain, which the buildroot compiles from scratch to produce AdGuard Home. ccache is
