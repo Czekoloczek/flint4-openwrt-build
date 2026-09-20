@@ -81,6 +81,14 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: openwrt/.ccache
+          key: ccache-${{ env.UPSTREAM_BRANCH }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.UPSTREAM_BRANCH }}-
+
       - name: Seed target configuration
         run: |
           cd openwrt
@@ -95,7 +103,10 @@ jobs:
             CONFIG_TARGET_mediatek_filogic=y \
             CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_glinet_gl-be14000=y \
             CONFIG_PACKAGE_luci=y \
-            CONFIG_PACKAGE_glinet-panel-ui=y
+            CONFIG_PACKAGE_glinet-panel-ui=y \
+            CONFIG_PACKAGE_luci-app-glinet-panel=y \
+            CONFIG_PACKAGE_ucode-mod-lvgl=y \
+            CONFIG_PACKAGE_kmod-hwmon-pwmfan=y
           do
             if grep -qx "$opt" .config; then
               echo "ok   $opt"
@@ -131,9 +142,34 @@ jobs:
           cd openwrt/bin/targets/mediatek/filogic
           ls -lh
           mkdir -p "$GITHUB_WORKSPACE/out"
-          cp -v *glinet_gl-be14000*.bin "$GITHUB_WORKSPACE/out/" || true
-          cp -v sha256sums "$GITHUB_WORKSPACE/out/" || true
+          cp -v *glinet_gl-be14000*.bin "$GITHUB_WORKSPACE/out/"
+          cp -v sha256sums config.buildinfo "$GITHUB_WORKSPACE/out/" || true
+          cp -v *glinet_gl-be14000*.manifest "$GITHUB_WORKSPACE/out/" || true
           echo "stamp=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm panel packages are in the image
+        run: |
+          cd openwrt/bin/targets/mediatek/filogic
+          m=$(ls *glinet_gl-be14000*.manifest 2>/dev/null | head -1)
+          if [ -z "$m" ]; then
+            echo "no manifest produced - skipping the check"
+            exit 0
+          fi
+          for pkg in luci-app-glinet-panel glinet-panel-ui ucode-mod-lvgl \
+                     glinet-panel-firmware kmod-hwmon-pwmfan luci; do
+            if grep -q "^${pkg} " "$m"; then
+              echo "ok   $pkg"
+            else
+              echo "FAIL $pkg did not make it into the image"
+              exit 1
+            fi
+          done
+          {
+            echo "### packages in image"
+            echo "\`\`\`"
+            wc -l < "$m" | tr -d '\n'; echo " packages total"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
