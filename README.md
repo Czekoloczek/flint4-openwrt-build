@@ -86,6 +86,12 @@ inactivity.
 | unchanged | changed | missing | build |
 | changed | changed | missing | build |
 
+A release only appears when a build **finishes**, so the list above cannot see a build that
+is still running. `check` therefore also counts in-flight runs on the same commit and skips
+if one is already building — otherwise a scheduled run landing mid-build duplicates roughly
+three hours of work. `force` bypasses every one of these tests, so deliberate parallel manual
+builds still work.
+
 **`build`** only runs when `check` says so. Manual runs default to `force`, which builds
 regardless.
 

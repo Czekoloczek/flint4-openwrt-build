@@ -49,12 +49,25 @@ jobs:
           echo "short=$short" >> "$GITHUB_OUTPUT"
           echo "self=$self"   >> "$GITHUB_OUTPUT"
 
+          # A run already building this exact pair has not published its release
+          # yet, so the release list alone cannot see it. Count sibling runs on the
+          # same commit to avoid duplicating a build that is still in flight.
+          inflight=$(gh run list --repo "$GITHUB_REPOSITORY" --limit 50 \
+                       --json databaseId,headSha,status \
+                       --jq '.[] | select(.status == "in_progress" or .status == "queued")
+                                 | "\(.databaseId) \(.headSha)"' \
+                     | grep " ${GITHUB_SHA}$" \
+                     | grep -vc "^${GITHUB_RUN_ID} " || true)
+
           if [ "${{ inputs.force }}" = "true" ]; then
             reason="manual run with force"
             build=true
           elif gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
                --json tagName --jq '.[].tagName' | grep -q -- "-${short}-${self}$"; then
             reason="a release for upstream ${short} built from ${self} already exists"
+            build=false
+          elif [ "${inflight:-0}" -gt 0 ]; then
+            reason="${inflight} run(s) already building ${self}; it just has not published yet"
             build=false
           else
             reason="no release for upstream ${short} built from ${self} yet"
