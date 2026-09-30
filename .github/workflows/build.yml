@@ -26,6 +26,11 @@ env:
   # fetched unpinned at build time, but its movement alone never starts one.
   FEED_REPO: openwrt/packages
   FEED_BRANCH: master
+  # Mainline moved device-node handling into *-support packages on 2026-09-29
+  # and the packages feed began depending on them hours later. A base tree
+  # without them cannot use the feed past this commit: libdrm drops out, and
+  # the panel UI with it. The hold lifts itself once the base tree catches up.
+  PACKAGES_HOLD: 059ba7d4fda5cb00f429f49b1061fb81e121456c
   FEED_WATCH: >-
     net/adguardhome
     net/acme-acmesh
@@ -33,6 +38,34 @@ env:
     net/vnstat2
     net/nlbwmon
     lang/golang
+  # LuCI packages in the image. Their code and Polish translations are watched;
+  # translations into other languages never reach the image.
+  LUCI_REPO: https://github.com/openwrt/luci.git
+  LUCI_BRANCH: master
+  LUCI_WATCH: >-
+    collections/luci
+    collections/luci-light
+    collections/luci-ssl
+    modules/luci-base
+    modules/luci-mod-admin-full
+    modules/luci-mod-dashboard
+    modules/luci-mod-network
+    modules/luci-mod-status
+    modules/luci-mod-system
+    applications/luci-app-acme
+    applications/luci-app-firewall
+    applications/luci-app-nlbwmon
+    applications/luci-app-package-manager
+    applications/luci-app-vnstat2
+    libs/luci-lib-chartjs
+    libs/luci-lib-jsonc
+    libs/luci-lib-uqr
+    libs/rpcd-mod-luci
+    protocols/luci-proto-ipv6
+    protocols/luci-proto-ppp
+    themes/luci-theme-bootstrap
+    themes/luci-theme-footstrap
+    themes/luci-theme-material
 
 jobs:
   check:
@@ -59,17 +92,51 @@ jobs:
           short=${sha:0:7}
           self=$(echo "$GITHUB_SHA" | cut -c1-7)
 
+          # Mirror the feed hold the build applies, so the fingerprint describes
+          # the feed state that actually goes into the image.
+          up=${UPSTREAM_REPO#https://github.com/}; up=${up%.git}
+          if gh api "repos/$up/contents/package/system/hardware-support/Makefile?ref=$sha" \
+               --jq .content 2>/dev/null | base64 -d | grep -q 'define Package/video-support'; then
+            feed_ref=$FEED_BRANCH
+          else
+            feed_ref=$PACKAGES_HOLD
+          fi
+
           # Fingerprint the last commit touching each watched feed package, so
           # a new version of any of them counts as a change too.
           watched=""
+          [ "$feed_ref" = "$FEED_BRANCH" ] || watched="packages-held@${feed_ref:0:7}"
           for p in $FEED_WATCH; do
-            c=$(gh api "repos/$FEED_REPO/commits?path=$p&sha=$FEED_BRANCH&per_page=1" --jq '.[0].sha // empty')
+            c=$(gh api "repos/$FEED_REPO/commits?path=$p&sha=$feed_ref&per_page=1" --jq '.[0].sha // empty')
             if [ -z "$c" ]; then
               echo "could not resolve the last commit of $p in $FEED_REPO"
               exit 1
             fi
             watched="$watched ${p##*/}@${c:0:7}"
           done
+
+          # LuCI: the API cannot leave out other languages' translations, so
+          # use a small blobless clone. In a shallow clone the oldest commit
+          # looks as if it added every file, so it must never count as a change.
+          l=$(mktemp -d)
+          git clone -q --filter=blob:none --no-checkout --depth=300 \
+              --single-branch --branch "$LUCI_BRANCH" "$LUCI_REPO" "$l"
+          boundary=" $(tr '\n' ' ' < "$l/.git/shallow") "
+          last() {
+            local c
+            c=$(git -C "$l" log -1 --format=%H -- "$@")
+            case "$boundary" in *" $c "*) c="" ;; esac
+            echo "${c:-none}"
+          }
+          code=$(last $LUCI_WATCH ':(exclude,glob)**/po/**')
+          plp=""
+          for p in $LUCI_WATCH; do plp="$plp $p/po/pl"; done
+          pl=$(last $plp)
+          if [ "$code" = none ]; then
+            echo "no LuCI code change in the last 300 commits - clone too shallow?"
+            exit 1
+          fi
+          watched="$watched luci@${code:0:7} luci-pl@${pl:0:7}"
           watched=${watched# }
           feeds=$(printf '%s' "$watched" | sha256sum | cut -c1-7)
 
@@ -179,6 +246,11 @@ jobs:
       - name: Update and install feeds
         run: |
           cd openwrt
+          if ! grep -qs 'define Package/video-support' package/system/hardware-support/Makefile; then
+            sed -i "s|^src-git packages \([^ ^;]*\).*|src-git packages \1^$PACKAGES_HOLD|" feeds.conf.default
+            echo "::warning title=packages feed held::the base tree predates mainline's *-support packages - packages feed pinned to ${PACKAGES_HOLD:0:7}"
+          fi
+          grep '^src-git packages ' feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           sed -i '/^src-git blogic /d' feeds.conf.default

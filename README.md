@@ -80,6 +80,7 @@ Two jobs. **`check`** fingerprints three things and builds when **any** of them 
 | upstream `flint4-support` | `git ls-remote` of the branch head |
 | this repository | the commit the workflow runs from |
 | watched feed packages | the last commit touching each path in `FEED_WATCH` |
+| LuCI in the image | the last commit touching `LUCI_WATCH`, code and Polish translations separately |
 
 The release tag carries all three, `auto-<stamp>-<upstream>-<repo>-<feeds>`, and a build runs
 whenever that combination has no release yet. It costs seconds and runs **every 4 hours**, which
@@ -87,9 +88,20 @@ also keeps the schedule from being disabled for inactivity.
 
 Feeds are fetched unpinned at build time, but a feed update alone would never start a build.
 `FEED_WATCH` covers the packages where an update matters: AdGuard Home, acme, vnstat, nlbwmon and
-the Go toolchain AdGuard Home is compiled with. LuCI is deliberately not watched — its
-translations change almost daily. `feeds.buildinfo` in each release records the exact feed
-commits that went in.
+the Go toolchain AdGuard Home is compiled with. `LUCI_WATCH` lists the LuCI packages in the
+image; `check` reads them from a 2 MB blobless clone, because translations into other languages
+— most of LuCI's commits — never reach the image and must not trigger a build. Keep
+`LUCI_WATCH` in step with the LuCI packages in the configuration. `feeds.buildinfo` in each
+release records the exact feed commits that went in.
+
+**Feed hold.** The feeds track mainline, while the base tree trails it by days. When mainline
+makes a tree-wide change that the packages feed follows at once, the feed outruns the base. It
+happened on 2026-09-29: device-node handling moved into `*-support` packages, `libdrm` began
+depending on `video-support`, and against a base tree without it the panel UI dropped out of the
+configuration — the configuration check stopped that build. While the base tree lacks
+`video-support`, the build pins the packages feed to `PACKAGES_HOLD`, the last commit before the
+change, and `check` fingerprints that held state. The hold lifts itself once the base tree
+catches up; the variable can be deleted then.
 
 A release only appears when a build **finishes**, so `check` also counts in-flight runs on the
 same commit and skips if one is already building — otherwise a scheduled run landing mid-build
@@ -126,7 +138,10 @@ updates against the official snapshot feeds, which move daily and are built agai
   out; kernel modules are not offered at all, because snapshots keep them in a separate
   `kmods/` repository the image does not reference.
 - **firmware** (`mt7988-wo-firmware`, `rtl8261c-firmware`, …) and **procd** come from the
-  general feeds and stay visible. Leave them to the next image.
+  general feeds and stay visible. Leave them to the next image. `rtl8261c-firmware` is not
+  even a newer version: mainline's package replaces this tree's firmware for the 10G PHY.
+- **LuCI** always shows updates. Its version is the timestamp of the newest commit anywhere in
+  the LuCI repository, so every package gets a new version even when its content is unchanged.
 
 ### 6 GHz needs a PSC channel
 
