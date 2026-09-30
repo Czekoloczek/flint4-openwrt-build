@@ -22,6 +22,17 @@ env:
   UPSTREAM_BRANCH: flint4-support
   PANEL_FEED: https://github.com/blogic/feed-blogic.git
   PANEL_LUCI: https://github.com/Beaverfffan/glinet-panel.git
+  # Feed packages whose updates should trigger a rebuild. The feed itself is
+  # fetched unpinned at build time, but its movement alone never starts one.
+  FEED_REPO: openwrt/packages
+  FEED_BRANCH: master
+  FEED_WATCH: >-
+    net/adguardhome
+    net/acme-acmesh
+    net/acme-common
+    net/vnstat2
+    net/nlbwmon
+    lang/golang
 
 jobs:
   check:
@@ -31,6 +42,8 @@ jobs:
       sha: ${{ steps.probe.outputs.sha }}
       short: ${{ steps.probe.outputs.short }}
       self: ${{ steps.probe.outputs.self }}
+      feeds: ${{ steps.probe.outputs.feeds }}
+      watched: ${{ steps.probe.outputs.watched }}
       should_build: ${{ steps.probe.outputs.should_build }}
     steps:
       - name: Probe upstream head and existing releases
@@ -45,11 +58,29 @@ jobs:
           fi
           short=${sha:0:7}
           self=$(echo "$GITHUB_SHA" | cut -c1-7)
-          echo "sha=$sha"     >> "$GITHUB_OUTPUT"
-          echo "short=$short" >> "$GITHUB_OUTPUT"
-          echo "self=$self"   >> "$GITHUB_OUTPUT"
 
-          # A run already building this exact pair has not published its release
+          # Fingerprint the last commit touching each watched feed package, so
+          # a new version of any of them counts as a change too.
+          watched=""
+          for p in $FEED_WATCH; do
+            c=$(gh api "repos/$FEED_REPO/commits?path=$p&sha=$FEED_BRANCH&per_page=1" --jq '.[0].sha // empty')
+            if [ -z "$c" ]; then
+              echo "could not resolve the last commit of $p in $FEED_REPO"
+              exit 1
+            fi
+            watched="$watched ${p##*/}@${c:0:7}"
+          done
+          watched=${watched# }
+          feeds=$(printf '%s' "$watched" | sha256sum | cut -c1-7)
+
+          echo "sha=$sha"         >> "$GITHUB_OUTPUT"
+          echo "short=$short"     >> "$GITHUB_OUTPUT"
+          echo "self=$self"       >> "$GITHUB_OUTPUT"
+          echo "feeds=$feeds"     >> "$GITHUB_OUTPUT"
+          echo "watched=$watched" >> "$GITHUB_OUTPUT"
+          suffix="${short}-${self}-${feeds}"
+
+          # A run already building this commit has not published its release
           # yet, so the release list alone cannot see it. Count sibling runs on the
           # same commit to avoid duplicating a build that is still in flight.
           inflight=$(gh run list --repo "$GITHUB_REPOSITORY" --limit 50 \
@@ -63,14 +94,14 @@ jobs:
             reason="manual run with force"
             build=true
           elif gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
-               --json tagName --jq '.[].tagName' | grep -q -- "-${short}-${self}$"; then
-            reason="a release for upstream ${short} built from ${self} already exists"
+               --json tagName --jq '.[].tagName' | grep -q -- "-${suffix}$"; then
+            reason="a release for ${suffix} already exists"
             build=false
           elif [ "${inflight:-0}" -gt 0 ]; then
             reason="${inflight} run(s) already building ${self}; it just has not published yet"
             build=false
           else
-            reason="no release for upstream ${short} built from ${self} yet"
+            reason="no release for ${suffix} yet"
             build=true
           fi
 
@@ -80,6 +111,7 @@ jobs:
             echo ""
             echo "- upstream: \`$UPSTREAM_BRANCH\` at \`$short\`"
             echo "- this repository: \`$self\`"
+            echo "- watched feed packages: \`$watched\` → \`$feeds\`"
             echo "- decision: **$( [ "$build" = true ] && echo build || echo skip )** — $reason"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "$reason -> build=$build"
@@ -124,7 +156,8 @@ jobs:
           sudo apt-get install -y \
             build-essential clang flex bison gawk gcc-multilib g++-multilib \
             gettext git libncurses-dev libssl-dev python3-setuptools rsync \
-            unzip zlib1g-dev file wget device-tree-compiler swig time ccache
+            unzip zlib1g-dev file wget device-tree-compiler swig time ccache \
+            squashfs-tools
 
       - name: Clone OpenWrt tree at the checked commit
         run: |
@@ -151,6 +184,9 @@ jobs:
           sed -i '/^src-git blogic /d' feeds.conf.default
           echo "blogic dropped from feeds.conf.default after install:"
           cat feeds.conf.default
+
+      - name: Add files overlay
+        run: cp -rv ci/files openwrt/
 
       - name: Restore ccache
         uses: actions/cache@v4
@@ -220,51 +256,65 @@ jobs:
           ls -lh
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp -v *glinet_gl-be14000*.bin "$GITHUB_WORKSPACE/out/"
-          cp -v sha256sums config.buildinfo "$GITHUB_WORKSPACE/out/" || true
+          cp -v sha256sums config.buildinfo feeds.buildinfo "$GITHUB_WORKSPACE/out/" || true
           cp -v *glinet_gl-be14000*.manifest "$GITHUB_WORKSPACE/out/" || true
           echo "stamp=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
 
-      - name: Confirm panel packages are in the image
+      - name: Verify the shipped image
         run: |
+          # Checks the rootfs inside the sysupgrade image itself. The earlier
+          # checks read a staging copy and a manifest apk builds never produce,
+          # so they silently passed.
           cd openwrt/bin/targets/mediatek/filogic
-          m=$(ls *glinet_gl-be14000*.manifest 2>/dev/null | head -1)
-          if [ -z "$m" ]; then
-            echo "no manifest produced - skipping the check"
-            exit 0
+          img=$(ls *glinet_gl-be14000*-squashfs-sysupgrade.bin | head -1)
+          work=$(mktemp -d)
+          tar -xf "$img" -C "$work" 2>/dev/null || true
+          sq=$(find "$work" -type f -name root | head -1)
+          if [ -z "$sq" ]; then
+            echo "FAIL no rootfs found inside $img"
+            exit 1
           fi
+          unsquashfs -q -d "$work/rootfs" "$sq" etc/apk etc/uci-defaults >/dev/null || true
+          r="$work/rootfs"
+          fail=0
+
           for pkg in luci-app-glinet-panel glinet-panel-ui ucode-mod-lvgl \
                      glinet-panel-firmware kmod-hwmon-pwmfan luci \
                      adguardhome nlbwmon vnstat2 luci-theme-material luci-i18n-base-pl \
                      acme-acmesh acme-acmesh-dnsapi luci-app-acme; do
-            if grep -q "^${pkg} " "$m"; then
+            if grep -qE "^${pkg}([=<>~]|$)" "$r/etc/apk/world" 2>/dev/null; then
               echo "ok   $pkg"
             else
               echo "FAIL $pkg did not make it into the image"
-              exit 1
+              fail=1
             fi
           done
+
+          d="$r/etc/apk/repositories.d/distfeeds.list"
+          if ! grep -q 'downloads.openwrt.org' "$d" 2>/dev/null; then
+            echo "FAIL the image has no distfeeds.list with the official feeds"
+            fail=1
+          elif grep -q blogic "$d"; then
+            echo "FAIL blogic is a runtime repo - apk update would break on its missing index"
+            fail=1
+          else
+            echo "ok   blogic is build-time only"
+          fi
+
+          if [ -f "$r/etc/uci-defaults/99-drop-target-feed" ]; then
+            echo "ok   the target repo is dropped on first boot"
+          else
+            echo "FAIL the files overlay did not reach the image"
+            fail=1
+          fi
+
           {
             echo "### packages in image"
             echo '```'
-            echo "$(wc -l < "$m") packages total"
+            echo "$(wc -l < "$r/etc/apk/world") packages in world"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Confirm blogic is not a runtime repository
-        run: |
-          cd openwrt
-          f=$(find build_dir -path '*/root-mediatek/etc/apk/repositories.d/*' -name '*.list' 2>/dev/null | head -1)
-          if [ -z "$f" ]; then
-            echo "no repositories.d list found in the staged rootfs - skipping"
-            exit 0
-          fi
-          echo "runtime repositories:"
-          cat "$f"
-          if grep -q blogic "$f"; then
-            echo "FAIL blogic is listed as a runtime repo - apk update will break on the missing index"
-            exit 1
-          fi
-          echo "ok   blogic is build-time only"
+          exit $fail
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -278,17 +328,20 @@ jobs:
         if: github.event_name == 'schedule' || inputs.create_release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: auto-${{ steps.collect.outputs.stamp }}-${{ needs.check.outputs.short }}-${{ needs.check.outputs.self }}
+          tag_name: auto-${{ steps.collect.outputs.stamp }}-${{ needs.check.outputs.short }}-${{ needs.check.outputs.self }}-${{ needs.check.outputs.feeds }}
           name: GL-BE14000 ${{ steps.collect.outputs.stamp }}
           body: |
             Automated OpenWrt build for the GL.iNet Flint 4 (GL-BE14000).
 
             Source: `JiaY-shi/openwrt` @ `flint4-support`, commit `${{ needs.check.outputs.short }}`
             Built from this repository at `${{ needs.check.outputs.self }}`
+            Watched feed packages: `${{ needs.check.outputs.watched }}` (fingerprint `${{ needs.check.outputs.feeds }}`)
             Panel UI: `blogic/feed-blogic` + `Beaverfffan/glinet-panel`
 
-            Flash `*-squashfs-factory.bin` from the GL.iNet U-Boot web recovery.
-            Use `*-squashfs-sysupgrade.bin` for later upgrades from LuCI.
+            Install `*-squashfs-sysupgrade.bin` from the stock firmware over SSH with
+            `sysupgrade -n`. `*-squashfs-factory.bin` carries no OpenWrt metadata and
+            both GL.iNet flashing paths reject it - see the README.
+            Later upgrades: flash the same sysupgrade image from LuCI, keeping settings.
 
             Unofficial build. No warranty. Verify the recovery procedure before flashing.
           files: out/*

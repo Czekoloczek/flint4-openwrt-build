@@ -73,27 +73,28 @@ your computer to `192.168.1.2/24`, open `http://192.168.1.1` and upload GL.iNet'
 
 ## Running the workflow
 
-Two jobs. **`check`** resolves the upstream head with `git ls-remote`, takes this repository's
-own commit, and looks for a release tagged `auto-<stamp>-<upstream>-<repo>`. If that exact pair
-already has a release the build is skipped; **a change on either side triggers a rebuild**. It
-costs seconds and runs **every 4 hours**, which also keeps the schedule from being disabled for
-inactivity.
+Two jobs. **`check`** fingerprints three things and builds when **any** of them changed:
 
-| upstream | this repo | release for the pair | decision |
-|---|---|---|---|
-| unchanged | unchanged | exists | skip |
-| changed | unchanged | missing | build |
-| unchanged | changed | missing | build |
-| changed | changed | missing | build |
+| Input | How it is read |
+|---|---|
+| upstream `flint4-support` | `git ls-remote` of the branch head |
+| this repository | the commit the workflow runs from |
+| watched feed packages | the last commit touching each path in `FEED_WATCH` |
 
-A release only appears when a build **finishes**, so the list above cannot see a build that
-is still running. `check` therefore also counts in-flight runs on the same commit and skips
-if one is already building — otherwise a scheduled run landing mid-build duplicates roughly
-three hours of work. `force` bypasses every one of these tests, so deliberate parallel manual
-builds still work.
+The release tag carries all three, `auto-<stamp>-<upstream>-<repo>-<feeds>`, and a build runs
+whenever that combination has no release yet. It costs seconds and runs **every 4 hours**, which
+also keeps the schedule from being disabled for inactivity.
 
-**`build`** only runs when `check` says so. Manual runs default to `force`, which builds
-regardless.
+Feeds are fetched unpinned at build time, but a feed update alone would never start a build.
+`FEED_WATCH` covers the packages where an update matters: AdGuard Home, acme, vnstat, nlbwmon and
+the Go toolchain AdGuard Home is compiled with. LuCI is deliberately not watched — its
+translations change almost daily. `feeds.buildinfo` in each release records the exact feed
+commits that went in.
+
+A release only appears when a build **finishes**, so `check` also counts in-flight runs on the
+same commit and skips if one is already building — otherwise a scheduled run landing mid-build
+duplicates roughly three hours of work. `force` bypasses every one of these tests, so deliberate
+parallel manual builds still work.
 
 A full build takes roughly **2.5–3.5 hours** on a standard 4 vCPU runner. Most of the tail is
 the Go toolchain, which the buildroot compiles from scratch to produce AdGuard Home. ccache is
@@ -102,10 +103,10 @@ enabled and cuts later runs.
 > This repository must stay **public**. Public repositories get 4 vCPU / 16 GB runners;
 > private ones get 2 vCPU / 8 GB, which pushes the build close to the 6 hour job limit.
 
-The workflow fails the build if the configuration or the resulting image is missing anything it
-should contain, if the `-ubootmod` variant gets selected, or if the blogic feed ends up as a
-runtime APK repository — that last one breaks `apk update`, because blogic hosts no
-`packages.adb` index.
+The workflow fails the build if the `-ubootmod` variant gets selected, or if the image itself —
+the rootfs unpacked from the sysupgrade file — is missing a required package, lists the blogic
+feed as a runtime APK repository (that breaks `apk update`, because blogic hosts no
+`packages.adb` index), or lacks the files overlay.
 
 ## After first boot
 
@@ -113,6 +114,19 @@ The package manager is `apk`, not `opkg` — OpenWrt switched with 25.12.
 
 Attended Sysupgrade and `owut` do **not** work here: they request images from OpenWrt's build
 server, which does not know this device. Upgrades stay manual.
+
+### Package updates
+
+Upgrade by flashing a newer image, not package by package. LuCI's package manager counts
+updates against the official snapshot feeds, which move daily and are built against mainline:
+
+- **base-files** from the official target repository carries mainline's sysupgrade platform
+  code, which does not know this board — installing it would break future upgrades. A
+  first-boot script (`files/etc/uci-defaults/99-drop-target-feed`) comments that repository
+  out; kernel modules are not offered at all, because snapshots keep them in a separate
+  `kmods/` repository the image does not reference.
+- **firmware** (`mt7988-wo-firmware`, `rtl8261c-firmware`, …) and **procd** come from the
+  general feeds and stay visible. Leave them to the next image.
 
 ### 6 GHz needs a PSC channel
 
@@ -136,8 +150,10 @@ and lists 2.4 GHz frequencies for it. Use `iw dev phy0.2-ap0 info` instead.
 
 ## Configuration
 
-Edit [`config/be14000.config`](config/be14000.config) and re-run the workflow with `force`.
-It is a seed fed to `make defconfig`, so it only needs options that differ from the defaults.
+Edit [`config/be14000.config`](config/be14000.config) and push — the next scheduled check
+builds it, or run the workflow manually to build right away. It is a seed fed to
+`make defconfig`, so it only needs options that differ from the defaults. Files under
+[`files/`](files) are copied into the image as they are.
 
 ## Credits
 

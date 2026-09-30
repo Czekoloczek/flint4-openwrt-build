@@ -1,0 +1,9 @@
+#!/bin/sh
+# The official target repository ships base-files, the kernel package and the
+# toolchain libraries built for mainline OpenWrt. base-files carries the
+# sysupgrade platform code, and mainline's copy does not know this board, so
+# installing it from there would break future upgrades. Everything else in that
+# repository is either already in this image or needs kernel modules that only
+# this build provides. Comment it out; lines already commented are left alone.
+sed -i '\#^http.*/targets/#s/^/# /' /etc/apk/repositories.d/distfeeds.list 2>/dev/null
+exit 0
