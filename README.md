@@ -103,6 +103,16 @@ configuration — the configuration check stopped that build. While the base tre
 change, and `check` fingerprints that held state. The hold lifts itself once the base tree
 catches up; the variable can be deleted then.
 
+**Replaying onto mainline** (`REBASE_ONTO_MAIN`, currently off). When the device branch falls
+behind, the build can replay its commits onto current mainline instead: `check` picks the
+mainline commit (`MAIN_CADENCE`: the state at 00:00 UTC, or every board-relevant commit) and
+adds it to the fingerprint; the build rebases with `union` merges for the shared device lists
+(`REBASE_UNION`), mainline's version for files the branch only bumps (`REBASE_KEEP_MAIN`), and
+drops the branch's patch refreshes. Any other conflict falls back to the branch as it is. Tested
+on 2026-10-06: 40 of 41 commits replay, 37 of them byte-identical. It stays off because mainline
+gained its own RTL8261C support on 2026-09-24 — the 10G WAN PHY — while the branch still carries
+its own patches and firmware package for that chip, an overlap git cannot detect.
+
 A release only appears when a build **finishes**, so `check` also counts in-flight runs on the
 same commit and skips if one is already building — otherwise a scheduled run landing mid-build
 duplicates roughly three hours of work. `force` bypasses every one of these tests, so deliberate

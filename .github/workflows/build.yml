@@ -66,6 +66,30 @@ env:
     themes/luci-theme-bootstrap
     themes/luci-theme-footstrap
     themes/luci-theme-material
+  # Replay the device branch onto current mainline, so the kernel, the core
+  # packages and the feeds stay current while the branch itself is not
+  # rebased. A conflict the rules below do not cover falls back to building
+  # the branch as it is.
+  # OFF: since 2026-09-24 mainline carries its own RTL8261C support (the 10G
+  # WAN PHY), and the branch still adds its own patches and firmware package
+  # for the same chip. Git cannot see that overlap - it needs reconciling by
+  # hand before this is switched on.
+  REBASE_ONTO_MAIN: 'false'
+  MAINLINE_REPO: https://github.com/openwrt/openwrt.git
+  MAINLINE_BRANCH: main
+  # When mainline movement counts as a change: 'daily' takes the state at
+  # 00:00 UTC, so it adds at most one rebuild a day; 'every' follows every
+  # relevant commit, about three to four builds a day.
+  MAIN_CADENCE: daily
+  # Device lists both sides append to: keep both sides' lines.
+  REBASE_UNION: >-
+    package/boot/uboot-mediatek/Makefile
+    target/linux/mediatek/image/filogic.mk
+  # Files where the branch only bumps or toggles something mainline has since
+  # changed or dropped: mainline's version wins.
+  REBASE_KEEP_MAIN: >-
+    config/Config-build.in
+    package/network/services/hostapd/Makefile
 
 jobs:
   check:
@@ -77,6 +101,8 @@ jobs:
       self: ${{ steps.probe.outputs.self }}
       feeds: ${{ steps.probe.outputs.feeds }}
       watched: ${{ steps.probe.outputs.watched }}
+      main_sha: ${{ steps.probe.outputs.main_sha }}
+      since: ${{ steps.probe.outputs.since }}
       should_build: ${{ steps.probe.outputs.should_build }}
     steps:
       - name: Probe upstream head and existing releases
@@ -92,11 +118,47 @@ jobs:
           short=${sha:0:7}
           self=$(echo "$GITHUB_SHA" | cut -c1-7)
 
-          # Mirror the feed hold the build applies, so the fingerprint describes
-          # the feed state that actually goes into the image.
           up=${UPSTREAM_REPO#https://github.com/}; up=${up%.git}
-          if gh api "repos/$up/contents/package/system/hardware-support/Makefile?ref=$sha" \
-               --jq .content 2>/dev/null | base64 -d | grep -q 'define Package/video-support'; then
+          mr=${MAINLINE_REPO#https://github.com/}; mr=${mr%.git}
+
+          # Mainline: the commit to replay the device branch onto, and the
+          # last commit in it that touches this board (other targets left out).
+          main_sha=""; since=""; mrel=""
+          if [ "$REBASE_ONTO_MAIN" = true ]; then
+            mb=$(gh api "repos/$mr/compare/$MAINLINE_BRANCH...${up%%/*}:${up##*/}:$sha" \
+                   --jq '.merge_base_commit.commit.committer.date')
+            since=$(date -u -d "${mb:?no merge base with mainline} -2 days" +%F)
+            m=$(mktemp -d)
+            git clone -q --filter=blob:none --no-checkout \
+                --shallow-since="$(date -u -d '-8 days' +%F)" \
+                --single-branch --branch "$MAINLINE_BRANCH" "$MAINLINE_REPO" "$m"
+            cutoff=now
+            [ "$MAIN_CADENCE" = daily ] && cutoff="$(date -u +%F) 00:00 +0000"
+            main_sha=$(git -C "$m" rev-list -1 --before="$cutoff" HEAD)
+            ex=""
+            for t in $(git -C "$m" ls-tree -d --name-only "$main_sha" target/linux/); do
+              case "$t" in
+                target/linux/mediatek|target/linux/generic) ;;
+                *) ex="$ex :(exclude)$t" ;;
+              esac
+            done
+            mrel=$(git -C "$m" log -1 --format=%H "$main_sha" -- . $ex)
+            if [ -z "$mrel" ] || grep -qx "$mrel" "$m/.git/shallow"; then
+              echo "no board-relevant mainline commit in the last 8 days - clone too shallow?"
+              exit 1
+            fi
+          fi
+
+          # Mirror the feed hold the build applies, so the fingerprint describes
+          # the feed state that actually goes into the image. With the replay
+          # the base is mainline; without it, the device branch.
+          if [ -n "$main_sha" ]; then
+            hs=$(git -C "$m" show "$main_sha:package/system/hardware-support/Makefile" 2>/dev/null || true)
+          else
+            hs=$(gh api "repos/$up/contents/package/system/hardware-support/Makefile?ref=$sha" \
+                   --jq .content 2>/dev/null | base64 -d || true)
+          fi
+          if printf '%s' "$hs" | grep -q 'define Package/video-support'; then
             feed_ref=$FEED_BRANCH
           else
             feed_ref=$PACKAGES_HOLD
@@ -137,6 +199,7 @@ jobs:
             exit 1
           fi
           watched="$watched luci@${code:0:7} luci-pl@${pl:0:7}"
+          [ -n "$mrel" ] && watched="$watched main@${mrel:0:7}"
           watched=${watched# }
           feeds=$(printf '%s' "$watched" | sha256sum | cut -c1-7)
 
@@ -145,6 +208,8 @@ jobs:
           echo "self=$self"       >> "$GITHUB_OUTPUT"
           echo "feeds=$feeds"     >> "$GITHUB_OUTPUT"
           echo "watched=$watched" >> "$GITHUB_OUTPUT"
+          echo "main_sha=$main_sha" >> "$GITHUB_OUTPUT"
+          echo "since=$since"     >> "$GITHUB_OUTPUT"
           suffix="${short}-${self}-${feeds}"
 
           # A run already building this commit has not published its release
@@ -178,6 +243,7 @@ jobs:
             echo ""
             echo "- upstream: \`$UPSTREAM_BRANCH\` at \`$short\`"
             echo "- this repository: \`$self\`"
+            [ -n "$main_sha" ] && echo "- mainline target (\`$MAIN_CADENCE\`): \`${main_sha:0:7}\`"
             echo "- watched feed packages: \`$watched\` → \`$feeds\`"
             echo "- decision: **$( [ "$build" = true ] && echo build || echo skip )** — $reason"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -226,14 +292,57 @@ jobs:
             unzip zlib1g-dev file wget device-tree-compiler swig time ccache \
             squashfs-tools
 
-      - name: Clone OpenWrt tree at the checked commit
+      - name: Prepare the OpenWrt tree
+        id: tree
+        env:
+          SHA: ${{ needs.check.outputs.sha }}
+          MAIN_SHA: ${{ needs.check.outputs.main_sha }}
+          SINCE: ${{ needs.check.outputs.since }}
         run: |
           mkdir openwrt && cd openwrt
           git init -q
-          git remote add origin "$UPSTREAM_REPO"
-          git fetch -q --depth 1 origin "${{ needs.check.outputs.sha }}"
-          git checkout -q FETCH_HEAD
-          echo "::notice title=Baseline::$(git log -1 --oneline)"
+          git remote add device "$UPSTREAM_REPO"
+          base="device branch as it is"
+          if [ "$REBASE_ONTO_MAIN" = true ] && [ -n "$MAIN_SHA" ]; then
+            git remote add main "$MAINLINE_REPO"
+            git fetch -q --shallow-since="$SINCE" device "$SHA"
+            git fetch -q --shallow-since="$SINCE" main "$MAIN_SHA"
+            for f in $REBASE_UNION; do echo "$f merge=union" >> .git/info/attributes; done
+            for f in $REBASE_KEEP_MAIN; do echo "$f merge=keepmain" >> .git/info/attributes; done
+            git config merge.keepmain.driver true
+            git config user.name ci
+            git config user.email ci@localhost
+            git checkout -q --detach "$SHA"
+            ok=true
+            if ! git rebase -q "$MAIN_SHA" > ../rebase.log 2>&1; then
+              while [ -d .git/rebase-merge ]; do
+                subj=$(git log -1 --format=%s REBASE_HEAD)
+                case "$subj" in
+                  *refresh*patches*)
+                    # mainline refreshes its own patches for its kernel
+                    echo "skipping superseded patch refresh: $subj"
+                    git rebase --skip >> ../rebase.log 2>&1 || true ;;
+                  *)
+                    echo "conflict the rules do not cover: $subj"
+                    git diff --name-only --diff-filter=U
+                    git rebase --abort
+                    ok=false
+                    break ;;
+                esac
+              done
+            fi
+            if $ok; then
+              base="rebased onto mainline ${MAIN_SHA:0:7} ($(git rev-list --count "$MAIN_SHA"..HEAD) commits)"
+            else
+              git checkout -q --detach "$SHA"
+              echo "::warning title=rebase skipped::the device branch does not replay cleanly onto mainline ${MAIN_SHA:0:7} - building it as it is"
+            fi
+          else
+            git fetch -q --depth 1 device "$SHA"
+            git checkout -q --detach FETCH_HEAD
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Baseline::$base - $(git log -1 --oneline)"
 
       - name: Add blogic feed for the TFT panel
         run: |
@@ -407,6 +516,7 @@ jobs:
 
             Source: `JiaY-shi/openwrt` @ `flint4-support`, commit `${{ needs.check.outputs.short }}`
             Built from this repository at `${{ needs.check.outputs.self }}`
+            Base: ${{ steps.tree.outputs.base }}
             Watched feed packages: `${{ needs.check.outputs.watched }}` (fingerprint `${{ needs.check.outputs.feeds }}`)
             Panel UI: `blogic/feed-blogic` + `Beaverfffan/glinet-panel`
 
