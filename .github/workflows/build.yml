@@ -344,6 +344,22 @@ jobs:
           echo "base=$base" >> "$GITHUB_OUTPUT"
           echo "::notice title=Baseline::$base - $(git log -1 --oneline)"
 
+      - name: Disable WED for mt7996
+        run: |
+          # With WED active, mt7996 takes per-client byte counters from a
+          # firmware path that reports zero on 5 GHz and nonsense on 2.4 GHz.
+          # Flow offloading is off in this setup anyway, so WED buys little;
+          # without it mac80211 counts every band correctly.
+          cd openwrt
+          f=package/kernel/mt76/Makefile
+          sed -i 's/^\([[:space:]]*MODPARAMS\.mt7996e:=\)wed_enable=1$/\1wed_enable=0/' "$f"
+          if grep -qE '^[[:space:]]*MODPARAMS\.mt7996e:=wed_enable=0$' "$f"; then
+            echo "ok   mt7996e loads with wed_enable=0"
+          else
+            echo "FAIL no MODPARAMS.mt7996e line to change in $f"
+            exit 1
+          fi
+
       - name: Add blogic feed for the TFT panel
         run: |
           cd openwrt
@@ -455,7 +471,7 @@ jobs:
             echo "FAIL no rootfs found inside $img"
             exit 1
           fi
-          unsquashfs -q -d "$work/rootfs" "$sq" etc/apk etc/uci-defaults >/dev/null || true
+          unsquashfs -q -d "$work/rootfs" "$sq" etc/apk etc/uci-defaults etc/modules.d >/dev/null || true
           r="$work/rootfs"
           fail=0
 
@@ -480,6 +496,13 @@ jobs:
             fail=1
           else
             echo "ok   blogic is build-time only"
+          fi
+
+          if grep -qx 'mt7996e wed_enable=0' "$r/etc/modules.d/mt7996e" 2>/dev/null; then
+            echo "ok   mt7996e loads with WED off"
+          else
+            echo "FAIL /etc/modules.d/mt7996e does not turn WED off"
+            fail=1
           fi
 
           if [ -f "$r/etc/uci-defaults/99-drop-target-feed" ]; then

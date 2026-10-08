@@ -168,6 +168,14 @@ uci commit wireless && wifi reload
 
 `rnr=1` makes the 2.4 and 5 GHz beacons advertise the co-located 6 GHz AP.
 
+### WED is off
+
+The build loads `mt7996e` with `wed_enable=0`. With WED on, the driver takes per-client byte
+counters from a firmware path that reports zero for every 5 GHz client and implausible values on
+2.4 GHz (608 bytes over 2156 packets), so the dashboard and `iw station dump` showed no usage.
+Packet counts were right, only bytes were wrong. Flow offloading is off in this setup anyway, so
+WED saved little; mac80211 now counts all bands.
+
 ### iwinfo is unreliable on MT7996
 
 Three radios share one `phy0`. `iwinfo` reports `Channel: 0 (unknown GHz)` for the 6 GHz radio
