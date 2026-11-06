@@ -1,0 +1,22 @@
+From: Flint 4 build CI
+Subject: mediatek: filogic: GL-BE14000: leave the panel SPI bus widths at default
+
+The panel node in mainline sets spi-tx-bus-width = <1> and
+spi-rx-bus-width = <0>. JiaY-shi's tree spelled these spi-tx-buswidth and
+spi-rx-buswidth, so the kernel never saw them and the SPI core used its
+defaults - and on that tree the panel lights up with the stock GL.iNet
+U-Boot. On mainline it is reported to stay dark with the stock U-Boot.
+These two properties are the only difference in the panel node between
+the two trees, so drop them to match the configuration known to work.
+
+--- a/target/linux/mediatek/dts/mt7988a-glinet-gl-be14000.dts
++++ b/target/linux/mediatek/dts/mt7988a-glinet-gl-be14000.dts
+@@ -673,8 +673,6 @@
+ 		compatible = "glinet,gl-be14000-panel", "panel-mipi-dbi-spi";
+ 		reg = <0>;
+ 		spi-max-frequency = <52000000>;
+-		spi-tx-bus-width = <1>;
+-		spi-rx-bus-width = <0>;
+ 		spi-cpol;
+ 		spi-cpha;
+ 

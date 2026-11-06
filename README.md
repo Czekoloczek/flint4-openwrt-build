@@ -3,20 +3,35 @@
 Automated CI build of OpenWrt for the GL.iNet Flint 4, including the front TFT panel UI.
 This repository holds only the workflow and the target configuration — no source tree.
 
-**Unofficial build. No warranty.** The Flint 4 is not supported by upstream OpenWrt.
+**Unofficial build. No warranty.** Mainline OpenWrt supports the Flint 4 since 2026-11-03, and
+official snapshot images exist. This build adds what they lack: the front panel UI, the packages
+below baked in, and a few fixes mainline does not carry yet.
 
 ## What it builds
 
 | | |
 |---|---|
-| Source tree | [`JiaY-shi/openwrt`](https://github.com/JiaY-shi/openwrt) @ `flint4-support` |
+| Source tree | [`openwrt/openwrt`](https://github.com/openwrt/openwrt) @ `main`, plus [`patches/`](patches) |
 | Target | `mediatek/filogic`, device `glinet_gl-be14000` (**not** the `-ubootmod` variant) |
 | Panel UI | [`blogic/feed-blogic`](https://github.com/blogic/feed-blogic) — `glinet-panel-ui`, ucode + LVGL |
 | Panel control | [`Beaverfffan/glinet-panel`](https://github.com/Beaverfffan/glinet-panel) — `luci-app-glinet-panel` |
 
-The `flint4-support` branch carries John Crispin's board support completed by JiaY-shi:
-the Motorcomm YT921x/YT922x DSA stack, the YT8824 quad 2.5GbE PHY, MT7996 Wi-Fi with WED,
-the RTL8261C 10G PHY, plus the PWM fan, backlight and touchscreen drivers.
+The board support is John Crispin's, completed by JiaY-shi: the Motorcomm YT921x/YT922x DSA
+stack, the YT8824 quad 2.5GbE PHY, MT7996 Wi-Fi, the RTL8261C 10G PHY, plus the PWM fan,
+backlight and touchscreen drivers. Until 2026-11 it lived only in JiaY-shi's `flint4-support`
+branch, which the images of this build came from; Crispin merged it into mainline on
+2026-11-03. The branch no longer moves and stays available as a fallback base (`BASE: jiay`).
+
+### Patches on top of mainline
+
+| Patch | Why |
+|---|---|
+| [`kernel/999-…-honour-openwrt-netdev-name`](patches/kernel) | The 10G GMAC registers only after the RTL8261C PHY is up, often after preinit has renamed the ports, so it can stay `eth2` and the WAN never comes up. Names the netdev from the device tree before it registers. By Nilanka de Silva, from JiaY-shi's tree; mainline did not take it. |
+| [`tree/0001-…-default-spi-bus-width`](patches/tree) | The panel is reported to stay dark on mainline with the stock GL.iNet U-Boot. The only difference in the panel node against JiaY-shi's tree, where it works, is the SPI bus width, which that tree misspelled and so left at default. |
+
+Both are checked against the tree on every build: the tree patch must apply, and the kernel patch
+is applied when the kernel is prepared, so a stale one fails the build rather than slipping
+through. Remove a patch once mainline carries its fix.
 
 ### In the image
 
@@ -73,18 +88,19 @@ your computer to `192.168.1.2/24`, open `http://192.168.1.1` and upload GL.iNet'
 
 ## Running the workflow
 
-Two jobs. **`check`** fingerprints three things and builds when **any** of them changed:
+Two jobs. **`check`** fingerprints these and builds when **any** of them changed:
 
 | Input | How it is read |
 |---|---|
-| upstream `flint4-support` | `git ls-remote` of the branch head |
-| this repository | the commit the workflow runs from |
+| the tree | mainline as it stood at 00:00 UTC (`MAIN_CADENCE: daily`; `every` follows its head) |
+| this repository | the commit the workflow runs from, which covers `patches/` and `files/` |
 | watched feed packages | the last commit touching each path in `FEED_WATCH` |
 | LuCI in the image | the last commit touching `LUCI_WATCH`, code and Polish translations separately |
 
-The release tag carries all three, `auto-<stamp>-<upstream>-<repo>-<feeds>`, and a build runs
-whenever that combination has no release yet. It costs seconds and runs **every 4 hours**, which
-also keeps the schedule from being disabled for inactivity.
+The release tag carries them, `auto-<stamp>-<base>-<tree>-<repo>-<feeds>`, and a build runs
+whenever that combination has no release yet. `check` costs seconds and runs **every 4 hours**.
+Mainline moves every day, so expect about one build a day, plus one for each change to this
+repository, a watched package or LuCI.
 
 Feeds are fetched unpinned at build time, but a feed update alone would never start a build.
 `FEED_WATCH` covers the packages where an update matters: AdGuard Home, acme, vnstat, nlbwmon and
@@ -93,25 +109,6 @@ image; `check` reads them from a 2 MB blobless clone, because translations into 
 — most of LuCI's commits — never reach the image and must not trigger a build. Keep
 `LUCI_WATCH` in step with the LuCI packages in the configuration. `feeds.buildinfo` in each
 release records the exact feed commits that went in.
-
-**Feed hold.** The feeds track mainline, while the base tree trails it by days. When mainline
-makes a tree-wide change that the packages feed follows at once, the feed outruns the base. It
-happened on 2026-09-29: device-node handling moved into `*-support` packages, `libdrm` began
-depending on `video-support`, and against a base tree without it the panel UI dropped out of the
-configuration — the configuration check stopped that build. While the base tree lacks
-`video-support`, the build pins the packages feed to `PACKAGES_HOLD`, the last commit before the
-change, and `check` fingerprints that held state. The hold lifts itself once the base tree
-catches up; the variable can be deleted then.
-
-**Replaying onto mainline** (`REBASE_ONTO_MAIN`, currently off). When the device branch falls
-behind, the build can replay its commits onto current mainline instead: `check` picks the
-mainline commit (`MAIN_CADENCE`: the state at 00:00 UTC, or every board-relevant commit) and
-adds it to the fingerprint; the build rebases with `union` merges for the shared device lists
-(`REBASE_UNION`), mainline's version for files the branch only bumps (`REBASE_KEEP_MAIN`), and
-drops the branch's patch refreshes. Any other conflict falls back to the branch as it is. Tested
-on 2026-10-06: 40 of 41 commits replay, 37 of them byte-identical. It stays off because mainline
-gained its own RTL8261C support on 2026-09-24 — the 10G WAN PHY — while the branch still carries
-its own patches and firmware package for that chip, an overlap git cannot detect.
 
 A release only appears when a build **finishes**, so `check` also counts in-flight runs on the
 same commit and skips if one is already building — otherwise a scheduled run landing mid-build
@@ -126,30 +123,31 @@ enabled and cuts later runs.
 > private ones get 2 vCPU / 8 GB, which pushes the build close to the 6 hour job limit.
 
 The workflow fails the build if the `-ubootmod` variant gets selected, or if the image itself —
-the rootfs unpacked from the sysupgrade file — is missing a required package, lists the blogic
-feed as a runtime APK repository (that breaks `apk update`, because blogic hosts no
-`packages.adb` index), or lacks the files overlay.
+the rootfs unpacked from the sysupgrade file — is missing a required package or the panel init
+sequence, lists the blogic feed as a runtime APK repository (that breaks `apk update`, because
+blogic hosts no `packages.adb` index), loads the Wi-Fi driver with WED on, or lacks the
+first-boot scripts.
 
 ## After first boot
 
 The package manager is `apk`, not `opkg` — OpenWrt switched with 25.12.
 
-Attended Sysupgrade and `owut` do **not** work here: they request images from OpenWrt's build
-server, which does not know this device. Upgrades stay manual.
+Attended Sysupgrade and `owut` would request an official image from OpenWrt's build server.
+That one now exists for this board, but it has neither the panel UI nor the patches above.
+Upgrade by flashing this build's sysupgrade image from LuCI, keeping settings.
 
 ### Package updates
 
 Upgrade by flashing a newer image, not package by package. LuCI's package manager counts
 updates against the official snapshot feeds, which move daily and are built against mainline:
 
-- **base-files** from the official target repository carries mainline's sysupgrade platform
-  code, which does not know this board — installing it would break future upgrades. A
-  first-boot script (`files/etc/uci-defaults/99-drop-target-feed`) comments that repository
-  out; kernel modules are not offered at all, because snapshots keep them in a separate
-  `kmods/` repository the image does not reference.
+- **base-files** and the kernel package in the official target repository belong to the
+  official image, not to this one. A first-boot script
+  (`files/etc/uci-defaults/99-drop-target-feed`) comments that repository out. Kernel modules
+  are not offered at all: snapshots keep them in a separate `kmods/` repository the image does
+  not reference, and they would not match this kernel anyway.
 - **firmware** (`mt7988-wo-firmware`, `rtl8261c-firmware`, …) and **procd** come from the
-  general feeds and stay visible. Leave them to the next image. `rtl8261c-firmware` is not
-  even a newer version: mainline's package replaces this tree's firmware for the 10G PHY.
+  general feeds and stay visible. Leave them to the next image.
 - **LuCI** always shows updates. Its version is the timestamp of the newest commit anywhere in
   the LuCI repository, so every package gets a new version even when its content is unchanged.
 
@@ -168,9 +166,20 @@ uci commit wireless && wifi reload
 
 `rnr=1` makes the 2.4 and 5 GHz beacons advertise the co-located 6 GHz AP.
 
+### Port names
+
+Mainline names the LAN ports after the case labels, `lan2`–`lan9`; JiaY-shi's tree, and so this
+build's images up to 2026-11, called the same ports `lan1`–`lan8`. A sysupgrade that keeps
+settings carries the bridge's port list over, and under the other naming one port drops out.
+The first-boot script `files/etc/uci-defaults/90-be14000-port-names` adds the neighbouring name
+next to every `lanN` port of a bridge. netifd skips a port that does not exist, so the list then
+works under both namings, a rollback to an older image included. VLANs or interfaces on a single
+port are not touched; the script logs them under `be14000-ports` for a look by hand.
+
 ### WED is off
 
-The build loads `mt7996e` with `wed_enable=0`. With WED on, the driver takes per-client byte
+Mainline loads `mt7996e` without WED; JiaY-shi's tree turned it on, and the build keeps it off
+for either base. With WED on, the driver takes per-client byte
 counters from a firmware path that reports zero for every 5 GHz client and implausible values on
 2.4 GHz (608 bytes over 2156 packets), so the dashboard and `iw station dump` showed no usage.
 Packet counts were right, only bytes were wrong. Flow offloading is off in this setup anyway, so
@@ -186,13 +195,15 @@ and lists 2.4 GHz frequencies for it. Use `iw dev phy0.2-ap0 info` instead.
 Edit [`config/be14000.config`](config/be14000.config) and push — the next scheduled check
 builds it, or run the workflow manually to build right away. It is a seed fed to
 `make defconfig`, so it only needs options that differ from the defaults. Files under
-[`files/`](files) are copied into the image as they are.
+[`files/`](files) are copied into the image as they are; [`patches/`](patches) is described
+above.
 
 ## Credits
 
 Board support by [John Crispin](https://github.com/blogic) and
 [JiaY-shi](https://github.com/JiaY-shi). Panel UI by John Crispin. LuCI panel control by
-[Beaverfffan](https://github.com/Beaverfffan). Prior art and the runtime-feed fix from
+[Beaverfffan](https://github.com/Beaverfffan). The netdev naming fix by
+[Nilanka de Silva](https://github.com/nilankadesilva). Prior art and the runtime-feed fix from
 [DiGz-Au/Flint4-build](https://github.com/DiGz-Au/Flint4-build) and
 [akorshun/openwrt](https://github.com/akorshun/openwrt).
 This repository only automates the build.

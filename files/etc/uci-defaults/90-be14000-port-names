@@ -1,0 +1,49 @@
+#!/bin/sh
+# Mainline OpenWrt names the GL-BE14000 LAN ports after the case labels,
+# lan2-lan9. JiaY-shi's tree, the base of this build's images up to
+# 2026-11, named the same ports lan1-lan8. A sysupgrade that keeps settings
+# carries the bridge port list over, and under the other naming one port
+# falls out of the bridge.
+#
+# Rather than rename, add the neighbouring name next to every lanN port of a
+# bridge. netifd skips a port that does not exist, so the list then works
+# under both namings - including a rollback to an image that does not carry
+# this script. Only bridges are touched; VLANs or interfaces on a single
+# port are left alone and logged.
+
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "glinet,gl-be14000" ] || exit 0
+
+# Which naming the running image uses, from the port list board.d wrote.
+lan_ports=" $(jsonfilter -i /etc/board.json -e '@.network.lan.ports[*]' 2>/dev/null | tr '\n' ' ') "
+case "$lan_ports" in
+*" lan9 "*) old=lan1; step=1 ;;	# mainline; a JiaY-shi config has lan1
+*" lan1 "*) old=lan9; step=-1 ;;	# JiaY-shi; a mainline config has lan9
+*) exit 0 ;;
+esac
+
+changed=0
+for sec in $(uci -q show network | sed -n 's/^network\.\([^.=]*\)=device$/\1/p'); do
+	[ "$(uci -q get "network.$sec.type")" = bridge ] || continue
+	ports=" $(uci -q get "network.$sec.ports") "
+	case "$ports" in *" $old "*) ;; *) continue ;; esac
+	for p in $ports; do
+		case "$p" in lan[1-9]) ;; *) continue ;; esac
+		n=$(( ${p#lan} + step ))
+		[ "$n" -ge 1 ] && [ "$n" -le 9 ] || continue
+		case "$ports" in *" lan$n "*) continue ;; esac
+		uci add_list "network.$sec.ports=lan$n"
+		ports="$ports lan$n "
+		changed=1
+	done
+done
+
+[ "$changed" = 1 ] && {
+	uci commit network
+	logger -t be14000-ports "bridge ports extended to cover both port namings"
+}
+
+# Anything else naming a single old port needs a look by hand.
+others=$(uci -q show network | grep -E "\.(device|ifname)='$old([.:][^']*)?'|\.ports=.*'$old:" )
+[ -n "$others" ] && logger -t be14000-ports "not changed, check by hand: $others"
+
+exit 0

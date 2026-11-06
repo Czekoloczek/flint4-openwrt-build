@@ -8,7 +8,7 @@ on:
         type: boolean
         default: true
       force:
-        description: Build even if upstream has not moved
+        description: Build even if nothing has changed
         type: boolean
         default: true
   schedule:
@@ -18,19 +18,25 @@ permissions:
   contents: write
 
 env:
-  UPSTREAM_REPO: https://github.com/JiaY-shi/openwrt.git
-  UPSTREAM_BRANCH: flint4-support
+  # Where the tree comes from.
+  #   main - official OpenWrt, which carries the GL-BE14000 since 2026-11-03,
+  #          plus this repository's patches/
+  #   jiay - JiaY-shi's flint4-support, the base of the images up to 2026-11.
+  #          It no longer moves; kept as a fallback.
+  BASE: main
+  MAINLINE_REPO: https://github.com/openwrt/openwrt.git
+  MAINLINE_BRANCH: main
+  # 'daily' builds main as it stood at 00:00 UTC, so main on its own starts at
+  # most one build a day; 'every' follows its head, several builds a day.
+  MAIN_CADENCE: daily
+  JIAY_REPO: https://github.com/JiaY-shi/openwrt.git
+  JIAY_BRANCH: flint4-support
   PANEL_FEED: https://github.com/blogic/feed-blogic.git
   PANEL_LUCI: https://github.com/Beaverfffan/glinet-panel.git
   # Feed packages whose updates should trigger a rebuild. The feed itself is
   # fetched unpinned at build time, but its movement alone never starts one.
   FEED_REPO: openwrt/packages
   FEED_BRANCH: master
-  # Mainline moved device-node handling into *-support packages on 2026-09-29
-  # and the packages feed began depending on them hours later. A base tree
-  # without them cannot use the feed past this commit: libdrm drops out, and
-  # the panel UI with it. The hold lifts itself once the base tree catches up.
-  PACKAGES_HOLD: 059ba7d4fda5cb00f429f49b1061fb81e121456c
   FEED_WATCH: >-
     net/adguardhome
     net/acme-acmesh
@@ -66,110 +72,62 @@ env:
     themes/luci-theme-bootstrap
     themes/luci-theme-footstrap
     themes/luci-theme-material
-  # Replay the device branch onto current mainline, so the kernel, the core
-  # packages and the feeds stay current while the branch itself is not
-  # rebased. A conflict the rules below do not cover falls back to building
-  # the branch as it is.
-  # OFF: since 2026-09-24 mainline carries its own RTL8261C support (the 10G
-  # WAN PHY), and the branch still adds its own patches and firmware package
-  # for the same chip. Git cannot see that overlap - it needs reconciling by
-  # hand before this is switched on.
-  REBASE_ONTO_MAIN: 'false'
-  MAINLINE_REPO: https://github.com/openwrt/openwrt.git
-  MAINLINE_BRANCH: main
-  # When mainline movement counts as a change: 'daily' takes the state at
-  # 00:00 UTC, so it adds at most one rebuild a day; 'every' follows every
-  # relevant commit, about three to four builds a day.
-  MAIN_CADENCE: daily
-  # Device lists both sides append to: keep both sides' lines.
-  REBASE_UNION: >-
-    package/boot/uboot-mediatek/Makefile
-    target/linux/mediatek/image/filogic.mk
-  # Files where the branch only bumps or toggles something mainline has since
-  # changed or dropped: mainline's version wins.
-  REBASE_KEEP_MAIN: >-
-    config/Config-build.in
-    package/network/services/hostapd/Makefile
 
 jobs:
   check:
-    name: Check upstream
+    name: Check sources
     runs-on: ubuntu-22.04
     outputs:
+      base: ${{ steps.probe.outputs.base }}
+      repo: ${{ steps.probe.outputs.repo }}
+      source: ${{ steps.probe.outputs.source }}
       sha: ${{ steps.probe.outputs.sha }}
       short: ${{ steps.probe.outputs.short }}
       self: ${{ steps.probe.outputs.self }}
       feeds: ${{ steps.probe.outputs.feeds }}
       watched: ${{ steps.probe.outputs.watched }}
-      main_sha: ${{ steps.probe.outputs.main_sha }}
-      since: ${{ steps.probe.outputs.since }}
       should_build: ${{ steps.probe.outputs.should_build }}
     steps:
-      - name: Probe upstream head and existing releases
+      - name: Probe the tree, the feeds and existing releases
         id: probe
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          sha=$(git ls-remote "$UPSTREAM_REPO" "refs/heads/$UPSTREAM_BRANCH" | cut -f1)
+          case "$BASE" in
+            main)
+              repo=$MAINLINE_REPO
+              if [ "$MAIN_CADENCE" = daily ]; then
+                mr=${MAINLINE_REPO#https://github.com/}; mr=${mr%.git}
+                cutoff="$(date -u +%F)T00:00:00Z"
+                sha=$(gh api "repos/$mr/commits?sha=$MAINLINE_BRANCH&until=$cutoff&per_page=1" --jq '.[0].sha // empty')
+                source="OpenWrt \`$MAINLINE_BRANCH\` as of $cutoff"
+              else
+                sha=$(git ls-remote "$repo" "refs/heads/$MAINLINE_BRANCH" | cut -f1)
+                source="OpenWrt \`$MAINLINE_BRANCH\`"
+              fi
+              ;;
+            jiay)
+              repo=$JIAY_REPO
+              sha=$(git ls-remote "$repo" "refs/heads/$JIAY_BRANCH" | cut -f1)
+              source="\`JiaY-shi/openwrt\` @ \`$JIAY_BRANCH\`"
+              ;;
+            *)
+              echo "unknown BASE '$BASE'"
+              exit 1
+              ;;
+          esac
           if [ -z "$sha" ]; then
-            echo "could not resolve $UPSTREAM_BRANCH on $UPSTREAM_REPO"
+            echo "could not resolve the $BASE tree"
             exit 1
           fi
           short=${sha:0:7}
           self=$(echo "$GITHUB_SHA" | cut -c1-7)
 
-          up=${UPSTREAM_REPO#https://github.com/}; up=${up%.git}
-          mr=${MAINLINE_REPO#https://github.com/}; mr=${mr%.git}
-
-          # Mainline: the commit to replay the device branch onto, and the
-          # last commit in it that touches this board (other targets left out).
-          main_sha=""; since=""; mrel=""
-          if [ "$REBASE_ONTO_MAIN" = true ]; then
-            mb=$(gh api "repos/$mr/compare/$MAINLINE_BRANCH...${up%%/*}:${up##*/}:$sha" \
-                   --jq '.merge_base_commit.commit.committer.date')
-            since=$(date -u -d "${mb:?no merge base with mainline} -2 days" +%F)
-            m=$(mktemp -d)
-            git clone -q --filter=blob:none --no-checkout \
-                --shallow-since="$(date -u -d '-8 days' +%F)" \
-                --single-branch --branch "$MAINLINE_BRANCH" "$MAINLINE_REPO" "$m"
-            cutoff=now
-            [ "$MAIN_CADENCE" = daily ] && cutoff="$(date -u +%F) 00:00 +0000"
-            main_sha=$(git -C "$m" rev-list -1 --before="$cutoff" HEAD)
-            ex=""
-            for t in $(git -C "$m" ls-tree -d --name-only "$main_sha" target/linux/); do
-              case "$t" in
-                target/linux/mediatek|target/linux/generic) ;;
-                *) ex="$ex :(exclude)$t" ;;
-              esac
-            done
-            mrel=$(git -C "$m" log -1 --format=%H "$main_sha" -- . $ex)
-            if [ -z "$mrel" ] || grep -qx "$mrel" "$m/.git/shallow"; then
-              echo "no board-relevant mainline commit in the last 8 days - clone too shallow?"
-              exit 1
-            fi
-          fi
-
-          # Mirror the feed hold the build applies, so the fingerprint describes
-          # the feed state that actually goes into the image. With the replay
-          # the base is mainline; without it, the device branch.
-          if [ -n "$main_sha" ]; then
-            hs=$(git -C "$m" show "$main_sha:package/system/hardware-support/Makefile" 2>/dev/null || true)
-          else
-            hs=$(gh api "repos/$up/contents/package/system/hardware-support/Makefile?ref=$sha" \
-                   --jq .content 2>/dev/null | base64 -d || true)
-          fi
-          if printf '%s' "$hs" | grep -q 'define Package/video-support'; then
-            feed_ref=$FEED_BRANCH
-          else
-            feed_ref=$PACKAGES_HOLD
-          fi
-
           # Fingerprint the last commit touching each watched feed package, so
           # a new version of any of them counts as a change too.
           watched=""
-          [ "$feed_ref" = "$FEED_BRANCH" ] || watched="packages-held@${feed_ref:0:7}"
           for p in $FEED_WATCH; do
-            c=$(gh api "repos/$FEED_REPO/commits?path=$p&sha=$feed_ref&per_page=1" --jq '.[0].sha // empty')
+            c=$(gh api "repos/$FEED_REPO/commits?path=$p&sha=$FEED_BRANCH&per_page=1" --jq '.[0].sha // empty')
             if [ -z "$c" ]; then
               echo "could not resolve the last commit of $p in $FEED_REPO"
               exit 1
@@ -199,18 +157,20 @@ jobs:
             exit 1
           fi
           watched="$watched luci@${code:0:7} luci-pl@${pl:0:7}"
-          [ -n "$mrel" ] && watched="$watched main@${mrel:0:7}"
           watched=${watched# }
           feeds=$(printf '%s' "$watched" | sha256sum | cut -c1-7)
 
-          echo "sha=$sha"         >> "$GITHUB_OUTPUT"
-          echo "short=$short"     >> "$GITHUB_OUTPUT"
-          echo "self=$self"       >> "$GITHUB_OUTPUT"
-          echo "feeds=$feeds"     >> "$GITHUB_OUTPUT"
-          echo "watched=$watched" >> "$GITHUB_OUTPUT"
-          echo "main_sha=$main_sha" >> "$GITHUB_OUTPUT"
-          echo "since=$since"     >> "$GITHUB_OUTPUT"
-          suffix="${short}-${self}-${feeds}"
+          {
+            echo "base=$BASE"
+            echo "repo=$repo"
+            echo "source=$source"
+            echo "sha=$sha"
+            echo "short=$short"
+            echo "self=$self"
+            echo "feeds=$feeds"
+            echo "watched=$watched"
+          } >> "$GITHUB_OUTPUT"
+          suffix="${BASE}-${short}-${self}-${feeds}"
 
           # A run already building this commit has not published its release
           # yet, so the release list alone cannot see it. Count sibling runs on the
@@ -239,11 +199,10 @@ jobs:
 
           echo "should_build=$build" >> "$GITHUB_OUTPUT"
           {
-            echo "### upstream check"
+            echo "### source check"
             echo ""
-            echo "- upstream: \`$UPSTREAM_BRANCH\` at \`$short\`"
+            echo "- tree: $source at \`$short\`"
             echo "- this repository: \`$self\`"
-            [ -n "$main_sha" ] && echo "- mainline target (\`$MAIN_CADENCE\`): \`${main_sha:0:7}\`"
             echo "- watched feed packages: \`$watched\` → \`$feeds\`"
             echo "- decision: **$( [ "$build" = true ] && echo build || echo skip )** — $reason"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -254,6 +213,8 @@ jobs:
     needs: check
     if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-22.04
+    env:
+      BASE: ${{ needs.check.outputs.base }}
 
     steps:
       - name: Free up disk space
@@ -293,72 +254,69 @@ jobs:
             squashfs-tools
 
       - name: Prepare the OpenWrt tree
-        id: tree
         env:
+          REPO: ${{ needs.check.outputs.repo }}
           SHA: ${{ needs.check.outputs.sha }}
-          MAIN_SHA: ${{ needs.check.outputs.main_sha }}
-          SINCE: ${{ needs.check.outputs.since }}
         run: |
           mkdir openwrt && cd openwrt
           git init -q
-          git remote add device "$UPSTREAM_REPO"
-          base="device branch as it is"
-          if [ "$REBASE_ONTO_MAIN" = true ] && [ -n "$MAIN_SHA" ]; then
-            git remote add main "$MAINLINE_REPO"
-            git fetch -q --shallow-since="$SINCE" device "$SHA"
-            git fetch -q --shallow-since="$SINCE" main "$MAIN_SHA"
-            for f in $REBASE_UNION; do echo "$f merge=union" >> .git/info/attributes; done
-            for f in $REBASE_KEEP_MAIN; do echo "$f merge=keepmain" >> .git/info/attributes; done
-            git config merge.keepmain.driver true
-            git config user.name ci
-            git config user.email ci@localhost
-            git checkout -q --detach "$SHA"
-            ok=true
-            if ! git rebase -q "$MAIN_SHA" > ../rebase.log 2>&1; then
-              while [ -d .git/rebase-merge ]; do
-                subj=$(git log -1 --format=%s REBASE_HEAD)
-                case "$subj" in
-                  *refresh*patches*)
-                    # mainline refreshes its own patches for its kernel
-                    echo "skipping superseded patch refresh: $subj"
-                    git rebase --skip >> ../rebase.log 2>&1 || true ;;
-                  *)
-                    echo "conflict the rules do not cover: $subj"
-                    git diff --name-only --diff-filter=U
-                    git rebase --abort
-                    ok=false
-                    break ;;
-                esac
-              done
-            fi
-            if $ok; then
-              base="rebased onto mainline ${MAIN_SHA:0:7} ($(git rev-list --count "$MAIN_SHA"..HEAD) commits)"
-            else
-              git checkout -q --detach "$SHA"
-              echo "::warning title=rebase skipped::the device branch does not replay cleanly onto mainline ${MAIN_SHA:0:7} - building it as it is"
-            fi
-          else
-            git fetch -q --depth 1 device "$SHA"
-            git checkout -q --detach FETCH_HEAD
-          fi
-          echo "base=$base" >> "$GITHUB_OUTPUT"
-          echo "::notice title=Baseline::$base - $(git log -1 --oneline)"
+          git remote add origin "$REPO"
+          git fetch -q --depth 1 origin "$SHA"
+          git checkout -q --detach FETCH_HEAD
+          echo "::notice title=Baseline::$BASE - $(git log -1 --oneline)"
 
-      - name: Disable WED for mt7996
+      - name: Apply this repository's patches
+        run: |
+          # patches/ is written against mainline; JiaY-shi's tree already
+          # carries the kernel fix and keeps its own panel node.
+          if [ "$BASE" != main ]; then
+            echo "base $BASE: patches/ is for mainline, skipping"
+            exit 0
+          fi
+          cd openwrt
+          for p in ../ci/patches/tree/*.patch; do
+            [ -e "$p" ] || continue
+            if git apply --check "$p" && git apply "$p"; then
+              echo "ok   tree: ${p##*/}"
+            else
+              echo "FAIL tree: ${p##*/} no longer applies - mainline changed that file"
+              exit 1
+            fi
+          done
+          # Kernel patches only get applied when the kernel is prepared during
+          # the build; a stale one fails the build there, loudly.
+          v=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/mediatek/Makefile)
+          dir=target/linux/mediatek/patches-$v
+          if [ ! -d "$dir" ]; then
+            echo "FAIL no $dir - mainline moved mediatek to another kernel"
+            exit 1
+          fi
+          for p in ../ci/patches/kernel/*.patch; do
+            [ -e "$p" ] || continue
+            if [ -e "$dir/${p##*/}" ]; then
+              echo "FAIL kernel: $dir already has ${p##*/}"
+              exit 1
+            fi
+            cp "$p" "$dir/"
+            echo "ok   kernel $v: ${p##*/}"
+          done
+
+      - name: Keep WED off for mt7996
         run: |
           # With WED active, mt7996 takes per-client byte counters from a
           # firmware path that reports zero on 5 GHz and nonsense on 2.4 GHz.
           # Flow offloading is off in this setup anyway, so WED buys little;
-          # without it mac80211 counts every band correctly.
+          # without it mac80211 counts every band correctly. Mainline already
+          # loads the driver without it; JiaY-shi's tree turned it on.
           cd openwrt
           f=package/kernel/mt76/Makefile
           sed -i 's/^\([[:space:]]*MODPARAMS\.mt7996e:=\)wed_enable=1$/\1wed_enable=0/' "$f"
-          if grep -qE '^[[:space:]]*MODPARAMS\.mt7996e:=wed_enable=0$' "$f"; then
-            echo "ok   mt7996e loads with wed_enable=0"
-          else
-            echo "FAIL no MODPARAMS.mt7996e line to change in $f"
+          if grep -qE '^[[:space:]]*MODPARAMS\.mt7996e:=.*wed_enable=1' "$f"; then
+            echo "FAIL $f still loads mt7996e with WED on"
             exit 1
           fi
+          line=$(grep -E 'MODPARAMS\.mt7996e' "$f" | tr -s ' \t' ' ' || true)
+          echo "ok   mt7996e loads without WED: ${line:-no MODPARAMS, driver default}"
 
       - name: Add blogic feed for the TFT panel
         run: |
@@ -371,11 +329,6 @@ jobs:
       - name: Update and install feeds
         run: |
           cd openwrt
-          if ! grep -qs 'define Package/video-support' package/system/hardware-support/Makefile; then
-            sed -i "s|^src-git packages \([^ ^;]*\).*|src-git packages \1^$PACKAGES_HOLD|" feeds.conf.default
-            echo "::warning title=packages feed held::the base tree predates mainline's *-support packages - packages feed pinned to ${PACKAGES_HOLD:0:7}"
-          fi
-          grep '^src-git packages ' feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           sed -i '/^src-git blogic /d' feeds.conf.default
@@ -389,9 +342,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: openwrt/.ccache
-          key: ccache-${{ env.UPSTREAM_BRANCH }}-${{ github.run_id }}
+          key: ccache-${{ needs.check.outputs.base }}-${{ github.run_id }}
           restore-keys: |
-            ccache-${{ env.UPSTREAM_BRANCH }}-
+            ccache-${{ needs.check.outputs.base }}-
 
       - name: Seed target configuration
         run: |
@@ -459,9 +412,8 @@ jobs:
 
       - name: Verify the shipped image
         run: |
-          # Checks the rootfs inside the sysupgrade image itself. The earlier
-          # checks read a staging copy and a manifest apk builds never produce,
-          # so they silently passed.
+          # Checks the rootfs inside the sysupgrade image itself, not a staging
+          # copy: earlier checks of that kind silently passed.
           cd openwrt/bin/targets/mediatek/filogic
           img=$(ls *glinet_gl-be14000*-squashfs-sysupgrade.bin | head -1)
           work=$(mktemp -d)
@@ -471,12 +423,12 @@ jobs:
             echo "FAIL no rootfs found inside $img"
             exit 1
           fi
-          unsquashfs -q -d "$work/rootfs" "$sq" etc/apk etc/uci-defaults etc/modules.d >/dev/null || true
+          unsquashfs -q -d "$work/rootfs" "$sq" etc/apk etc/uci-defaults etc/modules.d lib/firmware >/dev/null || true
           r="$work/rootfs"
           fail=0
 
           for pkg in luci-app-glinet-panel glinet-panel-ui ucode-mod-lvgl \
-                     glinet-panel-firmware kmod-hwmon-pwmfan luci \
+                     kmod-hwmon-pwmfan luci \
                      adguardhome nlbwmon vnstat2 luci-theme-material luci-i18n-base-pl \
                      acme-acmesh acme-acmesh-dnsapi luci-app-acme; do
             if grep -qE "^${pkg}([=<>~]|$)" "$r/etc/apk/world" 2>/dev/null; then
@@ -486,6 +438,15 @@ jobs:
               fail=1
             fi
           done
+
+          # Mainline and JiaY-shi ship the panel init sequence in differently
+          # named packages; the file the panel driver asks for is the same.
+          if [ -s "$r/lib/firmware/glinet,gl-be14000-panel.bin" ]; then
+            echo "ok   panel init sequence"
+          else
+            echo "FAIL no /lib/firmware/glinet,gl-be14000-panel.bin - the panel would stay dark"
+            fail=1
+          fi
 
           d="$r/etc/apk/repositories.d/distfeeds.list"
           if ! grep -q 'downloads.openwrt.org' "$d" 2>/dev/null; then
@@ -498,19 +459,25 @@ jobs:
             echo "ok   blogic is build-time only"
           fi
 
-          if grep -qx 'mt7996e wed_enable=0' "$r/etc/modules.d/mt7996e" 2>/dev/null; then
-            echo "ok   mt7996e loads with WED off"
-          else
-            echo "FAIL /etc/modules.d/mt7996e does not turn WED off"
+          m="$r/etc/modules.d/mt7996e"
+          if [ ! -f "$m" ]; then
+            echo "FAIL no /etc/modules.d/mt7996e"
             fail=1
+          elif grep -q 'wed_enable=1' "$m"; then
+            echo "FAIL /etc/modules.d/mt7996e turns WED on"
+            fail=1
+          else
+            echo "ok   mt7996e loads with WED off: $(cat "$m")"
           fi
 
-          if [ -f "$r/etc/uci-defaults/99-drop-target-feed" ]; then
-            echo "ok   the target repo is dropped on first boot"
-          else
-            echo "FAIL the files overlay did not reach the image"
-            fail=1
-          fi
+          for f in 90-be14000-port-names 99-drop-target-feed; do
+            if [ -f "$r/etc/uci-defaults/$f" ]; then
+              echo "ok   first-boot script $f"
+            else
+              echo "FAIL the files overlay did not reach the image: no $f"
+              fail=1
+            fi
+          done
 
           {
             echo "### packages in image"
@@ -532,14 +499,13 @@ jobs:
         if: github.event_name == 'schedule' || inputs.create_release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: auto-${{ steps.collect.outputs.stamp }}-${{ needs.check.outputs.short }}-${{ needs.check.outputs.self }}-${{ needs.check.outputs.feeds }}
-          name: GL-BE14000 ${{ steps.collect.outputs.stamp }}
+          tag_name: auto-${{ steps.collect.outputs.stamp }}-${{ needs.check.outputs.base }}-${{ needs.check.outputs.short }}-${{ needs.check.outputs.self }}-${{ needs.check.outputs.feeds }}
+          name: GL-BE14000 ${{ steps.collect.outputs.stamp }} (${{ needs.check.outputs.base }})
           body: |
             Automated OpenWrt build for the GL.iNet Flint 4 (GL-BE14000).
 
-            Source: `JiaY-shi/openwrt` @ `flint4-support`, commit `${{ needs.check.outputs.short }}`
+            Source: ${{ needs.check.outputs.source }}, commit `${{ needs.check.outputs.short }}`
             Built from this repository at `${{ needs.check.outputs.self }}`
-            Base: ${{ steps.tree.outputs.base }}
             Watched feed packages: `${{ needs.check.outputs.watched }}` (fingerprint `${{ needs.check.outputs.feeds }}`)
             Panel UI: `blogic/feed-blogic` + `Beaverfffan/glinet-panel`
 
