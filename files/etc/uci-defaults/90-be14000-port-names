@@ -13,6 +13,11 @@
 
 [ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "glinet,gl-be14000" ] || exit 0
 
+# uci-defaults run from /etc/init.d/boot, before logd starts, so a logger
+# line would be lost. logd reads the kernel log when it starts, so a line
+# written there shows up in both logread and dmesg.
+log() { { echo "<5>be14000-ports: $*" > /dev/kmsg; } 2>/dev/null; }
+
 # Which naming the running image uses, from the port list board.d wrote.
 lan_ports=" $(jsonfilter -i /etc/board.json -e '@.network.lan.ports[*]' 2>/dev/null | tr '\n' ' ') "
 case "$lan_ports" in
@@ -39,11 +44,11 @@ done
 
 [ "$changed" = 1 ] && {
 	uci commit network
-	logger -t be14000-ports "bridge ports extended to cover both port namings"
+	log "bridge ports extended to cover both port namings"
 }
 
 # Anything else naming a single old port needs a look by hand.
-others=$(uci -q show network | grep -E "\.(device|ifname)='$old([.:][^']*)?'|\.ports=.*'$old:" )
-[ -n "$others" ] && logger -t be14000-ports "not changed, check by hand: $others"
+others=$(uci -q show network | grep -E "\.(device|ifname)='$old([.:][^']*)?'|\.ports=.*'$old:" | tr '\n' ' ')
+[ -n "$others" ] && log "not changed, check by hand: $others"
 
 exit 0

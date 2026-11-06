@@ -174,7 +174,8 @@ settings carries the bridge's port list over, and under the other naming one por
 The first-boot script `files/etc/uci-defaults/90-be14000-port-names` adds the neighbouring name
 next to every `lanN` port of a bridge. netifd skips a port that does not exist, so the list then
 works under both namings, a rollback to an older image included. VLANs or interfaces on a single
-port are not touched; the script logs them under `be14000-ports` for a look by hand.
+port are not touched; the script logs them for a look by hand (`logread -e be14000-ports`).
+It writes to the kernel log, since uci-defaults run before logd starts.
 
 ### WED is off
 
