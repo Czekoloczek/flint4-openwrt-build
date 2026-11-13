@@ -240,7 +240,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout this repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: ci
 
@@ -339,7 +339,7 @@ jobs:
         run: cp -rv ci/files openwrt/
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: openwrt/.ccache
           key: ccache-${{ needs.check.outputs.base }}-${{ github.run_id }}
@@ -488,7 +488,7 @@ jobs:
           exit $fail
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gl-be14000-${{ steps.collect.outputs.stamp }}
           path: out/
@@ -497,7 +497,7 @@ jobs:
 
       - name: Publish release
         if: github.event_name == 'schedule' || inputs.create_release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: auto-${{ steps.collect.outputs.stamp }}-${{ needs.check.outputs.base }}-${{ needs.check.outputs.short }}-${{ needs.check.outputs.self }}-${{ needs.check.outputs.feeds }}
           name: GL-BE14000 ${{ steps.collect.outputs.stamp }} (${{ needs.check.outputs.base }})
