@@ -1,0 +1,8 @@
+
+config updater 'main'
+	# 1: look for a new build at 4:30 and 5:30 and install it if it changes the image
+	option enabled '0'
+	# postpone while the WAN carries more than this (kbit/s, 30 s average)
+	option idle_kbps '2000'
+	# after an update, roll back unless the router is healthy within this many seconds
+	option health_timeout '600'

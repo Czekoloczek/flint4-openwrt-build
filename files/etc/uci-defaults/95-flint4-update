@@ -1,0 +1,12 @@
+#!/bin/sh
+# Nightly runs of flint4-update (they do nothing until it is enabled in
+# /etc/config/flint4update) and its health check after an update.
+
+if ! grep -q 'flint4-update cron' /etc/crontabs/root 2>/dev/null; then
+	mkdir -p /etc/crontabs
+	echo '30 4 * * * /usr/sbin/flint4-update cron' >> /etc/crontabs/root
+	echo '30 5 * * * /usr/sbin/flint4-update cron' >> /etc/crontabs/root
+fi
+/etc/init.d/cron enable
+/etc/init.d/flint4-update enable
+exit 0

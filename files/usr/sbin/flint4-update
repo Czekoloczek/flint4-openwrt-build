@@ -1,0 +1,294 @@
+#!/bin/sh
+# Self-update of this GL-BE14000 build from the GitHub releases it came from.
+# See "Automatic updates" in the README of the build repository.
+#
+#   flint4-update check          what a run would do now; changes nothing
+#   flint4-update run [--busy] [--test-rollback]
+#                                update now if a newer build changes the image;
+#                                --busy skips the idle-WAN test, --test-rollback
+#                                fails the health check on purpose
+#   flint4-update cron           'run', if enabled in /etc/config/flint4update
+#   flint4-update health         after an update: check the router, roll back on
+#                                failure (started at boot by /etc/init.d/flint4-update)
+#   flint4-update status         show the state
+#
+# A release is taken only if its sha256sums carries a valid signature by the key
+# in /usr/share/flint4-update/signing.pub, and only if its content fingerprint
+# differs from the running build's. Before flashing, the image of the running
+# build is kept so a failed health check can flash it back.
+
+ROM=${FLINT4_ROM:-/rom}
+STATE=${FLINT4_STATE:-/etc/flint4-update}
+WORK=${FLINT4_WORK:-/tmp/flint4-update}
+PUB=${FLINT4_PUB:-/usr/share/flint4-update/signing.pub}
+SYS=${FLINT4_SYS:-/sys}
+IMG=openwrt-mediatek-filogic-glinet_gl-be14000-squashfs-sysupgrade.bin
+UA=flint4-update
+
+log() {
+	logger -t flint4-update -- "$*"
+	[ -t 1 ] && echo "$*"
+	return 0
+}
+
+die() {
+	log "$*"
+	exit 1
+}
+
+cfg() {
+	local v
+	v=$(uci -q get "flint4update.main.$1")
+	echo "${v:-$2}"
+}
+
+# FLINT4_TAG and FLINT4_REPO of the running build. The copy in the read-only
+# root is authoritative; /etc/flint4-release is the same file through overlayfs.
+release_info() {
+	local f=$ROM/etc/flint4-release
+	[ -f "$f" ] || f=/etc/flint4-release
+	[ -f "$f" ] || return 1
+	FLINT4_TAG=
+	FLINT4_REPO=
+	. "$f"
+	[ -n "$FLINT4_TAG" ] && [ -n "$FLINT4_REPO" ]
+}
+
+# auto-20261115-0833-main-... -> 202611150833
+stamp() {
+	echo "$1" | cut -d- -f2,3 | sed "s/-//g"
+}
+
+fetch() {
+	uclient-fetch -q -T 60 -U "$UA" -O "$2" "$1" >/dev/null 2>&1
+}
+
+asset() {
+	echo "https://github.com/$FLINT4_REPO/releases/download/$1/$2"
+}
+
+latest_tag() {
+	fetch "https://api.github.com/repos/$FLINT4_REPO/releases/latest" "$WORK/latest.json" || return 1
+	jsonfilter -i "$WORK/latest.json" -e '@.tag_name'
+}
+
+# checksum <metadir> <asset name> <file>
+checksum() {
+	local want have
+	want=$(awk -v n="$2" '{ f = $2; sub(/^\*/, "", f); if (f == n) print $1 }' "$1/sha256sums")
+	have=$(sha256sum "$3" | cut -d' ' -f1)
+	[ -n "$want" ] && [ "$want" = "$have" ] && return 0
+	log "checksum mismatch for $2"
+	return 1
+}
+
+# meta <tag> <dir>: signed sha256sums plus the fingerprint they cover.
+meta() {
+	local f
+	rm -rf "$2"
+	mkdir -p "$2"
+	for f in sha256sums sha256sums.sig fingerprint.txt; do
+		fetch "$(asset "$1" "$f")" "$2/$f" || { log "$1: cannot download $f"; return 1; }
+	done
+	if ! openssl pkeyutl -verify -pubin -inkey "$PUB" -rawin \
+			-in "$2/sha256sums" -sigfile "$2/sha256sums.sig" >/dev/null 2>&1; then
+		log "$1: BAD SIGNATURE on sha256sums, release ignored"
+		return 1
+	fi
+	checksum "$2" fingerprint.txt "$2/fingerprint.txt"
+}
+
+# image <tag> <metadir> <out>
+image() {
+	fetch "$(asset "$1" "$IMG")" "$3" || { log "$1: cannot download the image"; return 1; }
+	checksum "$2" "$IMG" "$3"
+}
+
+fp() {
+	awk -v k="$2" '$1 == k { $1 = ""; sub(/^ /, ""); print }' "$1"
+}
+
+# Names of the fingerprint parts that differ: "packages kernel".
+changed() {
+	local k out=
+	for k in packages luci panel-luci base-files overlay kernel dtb; do
+		[ "$(fp "$1" "$k")" = "$(fp "$2" "$k")" ] || out="$out $k"
+	done
+	echo "${out# }"
+}
+
+# Average WAN traffic over 30 s in kbit/s.
+wan_kbps() {
+	local dev s a b
+	dev=$(ifstatus wan 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+	s=$SYS/class/net/$dev/statistics
+	[ -n "$dev" ] && [ -r "$s/rx_bytes" ] || { echo 0; return; }
+	a=$(( $(cat "$s/rx_bytes") + $(cat "$s/tx_bytes") ))
+	sleep 30
+	b=$(( $(cat "$s/rx_bytes") + $(cat "$s/tx_bytes") ))
+	echo $(( (b - a) * 8 / 30 / 1000 ))
+}
+
+# What the health check compares, one key=value per line.
+probe() {
+	local up net luci
+	up=$(ifstatus wan 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
+	echo "wan=$([ "$up" = true ] && echo 1 || echo 0)"
+	# Name lookup, routing and TLS in one go; two sites, so one being down
+	# does not look like a broken router.
+	net=0
+	for u in https://downloads.openwrt.org/ https://api.github.com/; do
+		uclient-fetch -q -T 15 -U "$UA" -O /dev/null "$u" >/dev/null 2>&1 && { net=1; break; }
+	done
+	echo "internet=$net"
+	echo "lan_ports=$(ls "$SYS/class/net/br-lan/brif" 2>/dev/null | wc -l)"
+	echo "wifi=$(iw dev 2>/dev/null | grep -c Interface)"
+	pidof uhttpd >/dev/null && luci=1 || luci=0
+	echo "luci=$luci"
+}
+
+# Lines of $2 (now) that fall short of the same key in $1 (before the update).
+shortfall() {
+	awk -F= 'NR == FNR { want[$1] = $2; next } ($1 in want) && $2 + 0 < want[$1] + 0 { printf "%s=%s (was %s) ", $1, $2, want[$1] }' "$1" "$2"
+}
+
+# What a run would do; sets NEW and CUR. Returns 0 if an update is due.
+decide() {
+	release_info || { log "this image has no /etc/flint4-release; install a build with the updater by hand first"; return 1; }
+	CUR=$FLINT4_TAG
+	mkdir -p "$WORK" "$STATE"
+	NEW=$(latest_tag) || { log "cannot reach the GitHub API"; return 1; }
+	[ -n "$NEW" ] || { log "no release found in $FLINT4_REPO"; return 1; }
+	if [ "$NEW" = "$CUR" ]; then
+		log "up to date: $CUR"
+		return 1
+	fi
+	if [ "$(stamp "$NEW")" -le "$(stamp "$CUR")" ] 2>/dev/null; then
+		log "newest release $NEW is not newer than the running $CUR"
+		return 1
+	fi
+	if grep -qx "$NEW" "$STATE/bad" 2>/dev/null; then
+		log "skipping $NEW: it failed the health check before"
+		return 1
+	fi
+	meta "$NEW" "$WORK/new" || return 1
+	meta "$CUR" "$WORK/cur" || { log "cannot verify the running build $CUR"; return 1; }
+	what=$(changed "$WORK/cur/fingerprint.txt" "$WORK/new/fingerprint.txt")
+	if [ -z "$what" ]; then
+		log "$NEW changes nothing in the image against $CUR"
+		return 1
+	fi
+	log "$NEW changes $what against $CUR"
+	return 0
+}
+
+cmd_check() {
+	decide || return 0
+	echo "a run would now flash $NEW, after a WAN traffic test (limit $(cfg idle_kbps 2000) kbit/s)"
+	echo "free in $STATE: $(df -k "$STATE" | awk 'NR == 2 { print int($4 / 1024) }') MiB (needs about 30)"
+	echo "health check baseline now:"
+	probe | sed 's/^/  /'
+}
+
+cmd_run() {
+	local busy=0 test=0 kbps free a
+	for a in "$@"; do
+		case "$a" in
+		--busy) busy=1 ;;
+		--test-rollback) test=1 ;;
+		*) die "unknown option $a" ;;
+		esac
+	done
+	mkdir -p "$WORK"
+	mkdir "$WORK/lock" 2>/dev/null || die "another flint4-update is running"
+	trap 'rmdir "$WORK/lock"' EXIT
+	decide || return 0
+	if [ "$busy" = 0 ]; then
+		kbps=$(wan_kbps)
+		if [ "$kbps" -ge "$(cfg idle_kbps 2000)" ]; then
+			log "postponed: WAN carries $kbps kbit/s"
+			return 0
+		fi
+	fi
+	free=$(df -k "$STATE" | awk 'NR == 2 { print $4 }')
+	[ "${free:-0}" -ge 40000 ] || die "only ${free} KiB free in $STATE, not updating"
+	image "$NEW" "$WORK/new" "$WORK/new.bin" || die "not updating"
+	sysupgrade -T "$WORK/new.bin" >/dev/null 2>&1 || die "sysupgrade -T rejects $NEW, not updating"
+	# The image to fall back to: the running build, from its own signed release.
+	image "$CUR" "$WORK/cur" "$WORK/rollback.bin" || die "no image of the running build to fall back to, not updating"
+	mv "$WORK/rollback.bin" "$STATE/rollback.bin"
+	echo "$CUR" > "$STATE/rollback.tag"
+	probe > "$STATE/baseline"
+	printf 'PENDING_TAG=%s\nPENDING_FROM=%s\nPENDING_TEST=%s\n' "$NEW" "$CUR" "$test" > "$STATE/pending"
+	sync
+	log "flashing $NEW (from $CUR), keeping settings$([ "$test" = 1 ] && echo ', rollback test')"
+	sysupgrade "$WORK/new.bin"
+}
+
+cmd_health() {
+	local t=0 limit
+	if [ -f "$STATE/rolledback" ]; then
+		log "running $(cat "$STATE/rolledback") again after a failed update"
+		rm -f "$STATE/rolledback" "$STATE/rollback.bin" "$STATE/rollback.tag"
+	fi
+	[ -f "$STATE/pending" ] || return 0
+	PENDING_TAG= PENDING_FROM= PENDING_TEST=0
+	. "$STATE/pending"
+	release_info
+	if [ "$FLINT4_TAG" != "$PENDING_TAG" ]; then
+		log "the update to $PENDING_TAG did not take, running ${FLINT4_TAG:-?}"
+		rm -f "$STATE/pending"
+		return 0
+	fi
+	mkdir -p "$WORK"
+	limit=$(cfg health_timeout 600)
+	while :; do
+		probe > "$WORK/now"
+		short=$(shortfall "$STATE/baseline" "$WORK/now")
+		if [ "$PENDING_TEST" = 1 ]; then
+			short="rollback test, router state: $(tr '\n' ' ' < "$WORK/now")"
+			break
+		fi
+		if [ -z "$short" ]; then
+			log "update to $PENDING_TAG ok after ${t} s"
+			rm -f "$STATE/pending" "$STATE/baseline" "$STATE/rollback.bin" "$STATE/rollback.tag"
+			return 0
+		fi
+		[ "$t" -ge "$limit" ] && break
+		sleep 20
+		t=$((t + 20))
+	done
+	log "update to $PENDING_TAG FAILED after ${t} s: $short"
+	[ "$PENDING_TEST" = 1 ] || echo "$PENDING_TAG" >> "$STATE/bad"
+	rm -f "$STATE/pending" "$STATE/baseline"
+	if [ -f "$STATE/rollback.bin" ] && [ "$(cat "$STATE/rollback.tag" 2>/dev/null)" = "$PENDING_FROM" ]; then
+		echo "$PENDING_FROM" > "$STATE/rolledback"
+		cp "$STATE/rollback.bin" "$WORK/rollback.bin"
+		sync
+		log "rolling back to $PENDING_FROM"
+		sysupgrade "$WORK/rollback.bin"
+	else
+		log "no image of $PENDING_FROM to roll back to - flash it by hand"
+	fi
+}
+
+cmd_status() {
+	release_info && echo "running:  $FLINT4_TAG" || echo "running:  build without release info"
+	echo "nightly:  $([ "$(cfg enabled 0)" = 1 ] && echo enabled || echo disabled)"
+	[ -f "$STATE/pending" ] && echo "pending:  $(sed -n 's/^PENDING_TAG=//p' "$STATE/pending")"
+	[ -s "$STATE/bad" ] && echo "skipped:  $(tr '\n' ' ' < "$STATE/bad")"
+	echo "last log:"
+	logread -e flint4-update 2>/dev/null | tail -n 5 | sed 's/^/  /'
+}
+
+case "$1" in
+check) cmd_check ;;
+run) shift; cmd_run "$@" ;;
+cron) [ "$(cfg enabled 0)" = 1 ] && cmd_run ;;
+health) cmd_health ;;
+status) cmd_status ;;
+*)
+	sed -n '5,13s/^# \{0,1\}//p' "$0"
+	exit 1
+	;;
+esac

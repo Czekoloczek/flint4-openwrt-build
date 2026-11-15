@@ -1,11 +1,13 @@
 # OpenWrt build for GL.iNet Flint 4 (GL-BE14000)
 
-Automated CI build of OpenWrt for the GL.iNet Flint 4, including the front TFT panel UI.
+Automated CI build of OpenWrt for the GL.iNet Flint 4, with the front TFT panel UI and signed
+self-updates.
 This repository holds only the workflow and the target configuration — no source tree.
 
 **Unofficial build. No warranty.** Mainline OpenWrt supports the Flint 4 since 2026-11-03, and
-official snapshot images exist. This build adds what they lack: the front panel UI, the packages
-below baked in, and a few fixes mainline does not carry yet.
+official snapshot images exist; since 2026-11-14 mainline also selects the panel UI for it. This
+build adds what they lack: the LuCI panel control, the packages below baked in, a few fixes
+mainline does not carry yet, and automatic updates.
 
 ## What it builds
 
@@ -13,7 +15,7 @@ below baked in, and a few fixes mainline does not carry yet.
 |---|---|
 | Source tree | [`openwrt/openwrt`](https://github.com/openwrt/openwrt) @ `main`, plus [`patches/`](patches) |
 | Target | `mediatek/filogic`, device `glinet_gl-be14000` (**not** the `-ubootmod` variant) |
-| Panel UI | [`blogic/feed-blogic`](https://github.com/blogic/feed-blogic) — `glinet-panel-ui`, ucode + LVGL |
+| Panel UI | [`openwrt/packages`](https://github.com/openwrt/packages) — `glinet-panel-ui`, ucode + LVGL; until 2026-11-14 from [`blogic/feed-blogic`](https://github.com/blogic/feed-blogic) |
 | Panel control | [`Beaverfffan/glinet-panel`](https://github.com/Beaverfffan/glinet-panel) — `luci-app-glinet-panel` |
 
 The board support is John Crispin's, completed by JiaY-shi: the Motorcomm YT921x/YT922x DSA
@@ -96,6 +98,7 @@ Two jobs. **`check`** fingerprints these and builds when **any** of them changed
 | this repository | the commit the workflow runs from, which covers `patches/` and `files/` |
 | watched feed packages | the last commit touching each path in `FEED_WATCH` |
 | LuCI in the image | the last commit touching `LUCI_WATCH`, code and Polish translations separately |
+| LuCI panel app | the head of `PANEL_LUCI`, since `luci-app-glinet-panel` has no version |
 
 The release tag carries them, `auto-<stamp>-<base>-<tree>-<repo>-<feeds>`, and a build runs
 whenever that combination has no release yet. `check` costs seconds and runs **every 4 hours**.
@@ -103,8 +106,8 @@ Mainline moves every day, so expect about one build a day, plus one for each cha
 repository, a watched package or LuCI.
 
 Feeds are fetched unpinned at build time, but a feed update alone would never start a build.
-`FEED_WATCH` covers the packages where an update matters: AdGuard Home, acme, vnstat, nlbwmon and
-the Go toolchain AdGuard Home is compiled with. `LUCI_WATCH` lists the LuCI packages in the
+`FEED_WATCH` covers the packages where an update matters: AdGuard Home, acme, vnstat, nlbwmon,
+the Go toolchain AdGuard Home is compiled with, and the panel UI with LVGL and its ucode binding. `LUCI_WATCH` lists the LuCI packages in the
 image; `check` reads them from a 2 MB blobless clone, because translations into other languages
 — most of LuCI's commits — never reach the image and must not trigger a build. Keep
 `LUCI_WATCH` in step with the LuCI packages in the configuration. `feeds.buildinfo` in each
@@ -124,17 +127,28 @@ enabled and cuts later runs.
 
 The workflow fails the build if the `-ubootmod` variant gets selected, or if the image itself —
 the rootfs unpacked from the sysupgrade file — is missing a required package or the panel init
-sequence, lists the blogic feed as a runtime APK repository (that breaks `apk update`, because
-blogic hosts no `packages.adb` index), loads the Wi-Fi driver with WED on, or lacks the
-first-boot scripts.
+sequence, lists a runtime APK repository outside `downloads.openwrt.org` (a third-party feed
+without a `packages.adb` index breaks `apk update`), loads the Wi-Fi driver with WED on, lacks
+the first-boot scripts, or does not carry its own release tag and the updater with the right key.
+
+Each release also carries `packages.txt`, `fingerprint.txt` and `sha256sums.sig`; see
+[Automatic updates](#automatic-updates). The workflow signs `sha256sums` when the repository has
+the `FLINT4_SIGNING_KEY` secret: an Ed25519 private key in PEM
+(`openssl genpkey -algorithm ed25519`) that belongs to
+[`files/usr/share/flint4-update/signing.pub`](files/usr/share/flint4-update/signing.pub). A key
+that does not belong to it fails the build; without the secret the release is published unsigned,
+and routers will not update to it. The private key exists only in the secret. A new key means a
+new `signing.pub`, and routers take images signed with it only after one of them is flashed by
+hand.
 
 ## After first boot
 
 The package manager is `apk`, not `opkg` — OpenWrt switched with 25.12.
 
 Attended Sysupgrade and `owut` would request an official image from OpenWrt's build server.
-That one now exists for this board, but it has neither the panel UI nor the patches above.
-Upgrade by flashing this build's sysupgrade image from LuCI, keeping settings.
+That one now exists for this board, but without the LuCI panel control, the packages and the
+patches above. Upgrade by flashing this build's sysupgrade image from LuCI, keeping settings, or
+let the router do it, see below.
 
 ### Package updates
 
@@ -150,6 +164,47 @@ updates against the official snapshot feeds, which move daily and are built agai
   general feeds and stay visible. Leave them to the next image.
 - **LuCI** always shows updates. Its version is the timestamp of the newest commit anywhere in
   the LuCI repository, so every package gets a new version even when its content is unchanged.
+
+### Automatic updates
+
+Images built since 2026-11-15 carry `flint4-update`, which installs newer releases of this
+repository by itself. It is **off** until enabled. A router on an older image needs one of these
+images flashed by hand first.
+
+```sh
+flint4-update check                                    # what it would do now; changes nothing
+uci set flint4update.main.enabled=1 && uci commit flint4update
+flint4-update status                                   # state and the last log lines
+```
+
+At 4:30 and again at 5:30, router time, it looks at the newest release and installs it, keeping
+settings, when all of these hold:
+
+- **The release is signed.** The router checks `sha256sums.sig` against
+  `/usr/share/flint4-update/signing.pub` before it trusts any file of the release, so a release
+  edited after the build is refused.
+- **The image content changed.** [`scripts/fingerprint.sh`](scripts/fingerprint.sh) writes
+  `fingerprint.txt`: package versions, the LuCI and panel commits, the base-files content,
+  `files/`, the kernel's sources and the device tree. Two builds of the same sources get the same
+  fingerprint, although their kernels and some binaries differ by the build date, so a mainline
+  commit for another board does not reboot the router.
+- **The WAN is idle**: under 2 Mbit/s over 30 seconds (`idle_kbps`), so a stream or a download is
+  not cut. The 5:30 run tries again.
+
+Before flashing it fetches the image of the running build as well, from that build's own signed
+release, and keeps it in `/etc/flint4-update`, which survives the upgrade. After the reboot
+`/etc/init.d/flint4-update` compares the router with the state recorded just before: WAN up, the
+internet reachable (name lookup and TLS included), the number of LAN bridge members and Wi-Fi
+interfaces, LuCI running. If any of them falls short for 10 minutes (`health_timeout`), it
+flashes the kept image back and skips that release from then on.
+
+`flint4-update run --busy --test-rollback` performs a real update that fails its health check on
+purpose, to watch the rollback work once.
+
+It cannot help with an image that does not boot far enough to run the check. The board has a
+single firmware slot, so that takes the U-Boot web recovery
+([Going back to stock](#going-back-to-stock)) and then this build installed from the stock
+firmware again.
 
 ### 6 GHz needs a PSC channel
 
@@ -197,7 +252,7 @@ Edit [`config/be14000.config`](config/be14000.config) and push — the next sche
 builds it, or run the workflow manually to build right away. It is a seed fed to
 `make defconfig`, so it only needs options that differ from the defaults. Files under
 [`files/`](files) are copied into the image as they are; [`patches/`](patches) is described
-above.
+above, [`scripts/`](scripts) holds what the workflow calls.
 
 ## Credits
 

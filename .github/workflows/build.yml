@@ -31,7 +31,8 @@ env:
   MAIN_CADENCE: daily
   JIAY_REPO: https://github.com/JiaY-shi/openwrt.git
   JIAY_BRANCH: flint4-support
-  PANEL_FEED: https://github.com/blogic/feed-blogic.git
+  # The panel UI (glinet-panel-ui, ucode-mod-lvgl, lvgl) comes from the packages
+  # feed since 2026-11-14; its LuCI app still comes from here.
   PANEL_LUCI: https://github.com/Beaverfffan/glinet-panel.git
   # Feed packages whose updates should trigger a rebuild. The feed itself is
   # fetched unpinned at build time, but its movement alone never starts one.
@@ -44,6 +45,9 @@ env:
     net/vnstat2
     net/nlbwmon
     lang/golang
+    utils/glinet-panel-ui
+    utils/ucode-mod-lvgl
+    libs/lvgl
   # LuCI packages in the image. Their code and Polish translations are watched;
   # translations into other languages never reach the image.
   LUCI_REPO: https://github.com/openwrt/luci.git
@@ -157,6 +161,14 @@ jobs:
             exit 1
           fi
           watched="$watched luci@${code:0:7} luci-pl@${pl:0:7}"
+
+          # The LuCI panel app has no version of its own; its commit stands in.
+          panel=$(git ls-remote "$PANEL_LUCI" HEAD | cut -f1)
+          if [ -z "$panel" ]; then
+            echo "could not resolve $PANEL_LUCI"
+            exit 1
+          fi
+          watched="$watched glinet-panel@${panel:0:7}"
           watched=${watched# }
           feeds=$(printf '%s' "$watched" | sha256sum | cut -c1-7)
 
@@ -318,25 +330,35 @@ jobs:
           line=$(grep -E 'MODPARAMS\.mt7996e' "$f" | tr -s ' \t' ' ' || true)
           echo "ok   mt7996e loads without WED: ${line:-no MODPARAMS, driver default}"
 
-      - name: Add blogic feed for the TFT panel
+      - name: Add the LuCI panel app
         run: |
           cd openwrt
-          echo "src-git blogic $PANEL_FEED" >> feeds.conf.default
           git clone --depth 1 "$PANEL_LUCI" /tmp/glinet-panel
+          echo "glinet-panel at $(git -C /tmp/glinet-panel log -1 --oneline)"
           cp -r /tmp/glinet-panel/luci-app-glinet-panel package/
-          cat feeds.conf.default
 
       - name: Update and install feeds
         run: |
           cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-          sed -i '/^src-git blogic /d' feeds.conf.default
-          echo "blogic dropped from feeds.conf.default after install:"
-          cat feeds.conf.default
 
-      - name: Add files overlay
-        run: cp -rv ci/files openwrt/
+      - name: Add files overlay and release info
+        env:
+          SHORT: ${{ needs.check.outputs.short }}
+          SELF: ${{ needs.check.outputs.self }}
+          FEEDS: ${{ needs.check.outputs.feeds }}
+        run: |
+          cp -rv ci/files openwrt/
+          # The tag is fixed before the build so the image can carry it:
+          # flint4-update reads it to find its own release.
+          stamp=$(date -u +%Y%m%d-%H%M)
+          tag="auto-${stamp}-${BASE}-${SHORT}-${SELF}-${FEEDS}"
+          printf "FLINT4_REPO='%s'\nFLINT4_TAG='%s'\n" "$GITHUB_REPOSITORY" "$tag" \
+            > openwrt/files/etc/flint4-release
+          cat openwrt/files/etc/flint4-release
+          echo "STAMP=$stamp" >> "$GITHUB_ENV"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
 
       - name: Restore ccache
         uses: actions/cache@v6
@@ -408,9 +430,11 @@ jobs:
           cp -v *glinet_gl-be14000*.bin "$GITHUB_WORKSPACE/out/"
           cp -v sha256sums config.buildinfo feeds.buildinfo "$GITHUB_WORKSPACE/out/" || true
           cp -v *glinet_gl-be14000*.manifest "$GITHUB_WORKSPACE/out/" || true
-          echo "stamp=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+          echo "stamp=$STAMP" >> "$GITHUB_OUTPUT"
 
       - name: Verify the shipped image
+        env:
+          WATCHED: ${{ needs.check.outputs.watched }}
         run: |
           # Checks the rootfs inside the sysupgrade image itself, not a staging
           # copy: earlier checks of that kind silently passed.
@@ -423,7 +447,9 @@ jobs:
             echo "FAIL no rootfs found inside $img"
             exit 1
           fi
-          unsquashfs -q -d "$work/rootfs" "$sq" etc/apk etc/uci-defaults etc/modules.d lib/firmware >/dev/null || true
+          unsquashfs -q -d "$work/rootfs" "$sq" etc/apk etc/uci-defaults etc/modules.d lib/firmware \
+            etc/flint4-release etc/init.d etc/config usr/sbin/flint4-update usr/share/flint4-update \
+            lib/upgrade/keep.d >/dev/null || true
           r="$work/rootfs"
           fail=0
 
@@ -452,11 +478,11 @@ jobs:
           if ! grep -q 'downloads.openwrt.org' "$d" 2>/dev/null; then
             echo "FAIL the image has no distfeeds.list with the official feeds"
             fail=1
-          elif grep -q blogic "$d"; then
-            echo "FAIL blogic is a runtime repo - apk update would break on its missing index"
+          elif grep -E '^(https?|src)' "$d" | grep -qv 'downloads.openwrt.org'; then
+            echo "FAIL a runtime repo outside downloads.openwrt.org - apk update would break on it"
             fail=1
           else
-            echo "ok   blogic is build-time only"
+            echo "ok   runtime feeds are official only"
           fi
 
           m="$r/etc/modules.d/mt7996e"
@@ -470,7 +496,7 @@ jobs:
             echo "ok   mt7996e loads with WED off: $(cat "$m")"
           fi
 
-          for f in 90-be14000-port-names 99-drop-target-feed; do
+          for f in 90-be14000-port-names 95-flint4-update 99-drop-target-feed; do
             if [ -f "$r/etc/uci-defaults/$f" ]; then
               echo "ok   first-boot script $f"
             else
@@ -479,6 +505,34 @@ jobs:
             fi
           done
 
+          # Self-update: the image must know its own release and carry the key.
+          if grep -qx "FLINT4_TAG='$TAG'" "$r/etc/flint4-release" 2>/dev/null; then
+            echo "ok   release info: $TAG"
+          else
+            echo "FAIL /etc/flint4-release does not name $TAG"
+            fail=1
+          fi
+          pub=usr/share/flint4-update/signing.pub
+          if [ -x "$r/usr/sbin/flint4-update" ] && [ -x "$r/etc/init.d/flint4-update" ] &&
+             [ -f "$r/etc/config/flint4update" ] && [ -f "$r/lib/upgrade/keep.d/flint4-update" ] &&
+             cmp -s "$r/$pub" "$GITHUB_WORKSPACE/ci/files/$pub"; then
+            echo "ok   flint4-update with its key"
+          else
+            echo "FAIL flint4-update, its service, config, keep list or key is missing"
+            fail=1
+          fi
+
+          # What routers compare to decide on an update; see scripts/fingerprint.sh.
+          if bash "$GITHUB_WORKSPACE/ci/scripts/fingerprint.sh" "$img" \
+               "$GITHUB_WORKSPACE/openwrt" "$GITHUB_WORKSPACE/ci" "$WATCHED" \
+               "$GITHUB_WORKSPACE/out/packages.txt" > "$GITHUB_WORKSPACE/out/fingerprint.txt"; then
+            echo "ok   fingerprint $(awk '$1 == "id" { print substr($2, 1, 16) }' "$GITHUB_WORKSPACE/out/fingerprint.txt")"
+            cat "$GITHUB_WORKSPACE/out/fingerprint.txt"
+          else
+            echo "FAIL could not fingerprint the image"
+            fail=1
+          fi
+
           {
             echo "### packages in image"
             echo '```'
@@ -486,6 +540,34 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit $fail
+
+      - name: Sign the release
+        env:
+          SIGNING_KEY: ${{ secrets.FLINT4_SIGNING_KEY }}
+        run: |
+          # Routers update themselves only to a release whose sha256sums is
+          # signed by the key in files/usr/share/flint4-update/signing.pub.
+          cd out
+          rm -f sha256sums sha256sums.sig
+          sha256sum -- * > "$RUNNER_TEMP/sha256sums"
+          mv "$RUNNER_TEMP/sha256sums" sha256sums
+          cat sha256sums
+          pub=$GITHUB_WORKSPACE/ci/files/usr/share/flint4-update/signing.pub
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::warning title=Unsigned release::no FLINT4_SIGNING_KEY secret - routers will not update to this release"
+            exit 0
+          fi
+          k=$RUNNER_TEMP/signing.key
+          ( umask 077; printf '%s\n' "$SIGNING_KEY" > "$k" )
+          if ! openssl pkey -in "$k" -pubout | cmp -s - "$pub"; then
+            rm -f "$k"
+            echo "FAIL the FLINT4_SIGNING_KEY secret does not belong to $pub"
+            exit 1
+          fi
+          openssl pkeyutl -sign -inkey "$k" -rawin -in sha256sums -out sha256sums.sig
+          rm -f "$k"
+          openssl pkeyutl -verify -pubin -inkey "$pub" -rawin -in sha256sums -sigfile sha256sums.sig
+          echo "ok   release signed"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
@@ -499,7 +581,7 @@ jobs:
         if: github.event_name == 'schedule' || inputs.create_release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: auto-${{ steps.collect.outputs.stamp }}-${{ needs.check.outputs.base }}-${{ needs.check.outputs.short }}-${{ needs.check.outputs.self }}-${{ needs.check.outputs.feeds }}
+          tag_name: ${{ env.TAG }}
           name: GL-BE14000 ${{ steps.collect.outputs.stamp }} (${{ needs.check.outputs.base }})
           body: |
             Automated OpenWrt build for the GL.iNet Flint 4 (GL-BE14000).
@@ -507,12 +589,15 @@ jobs:
             Source: ${{ needs.check.outputs.source }}, commit `${{ needs.check.outputs.short }}`
             Built from this repository at `${{ needs.check.outputs.self }}`
             Watched feed packages: `${{ needs.check.outputs.watched }}` (fingerprint `${{ needs.check.outputs.feeds }}`)
-            Panel UI: `blogic/feed-blogic` + `Beaverfffan/glinet-panel`
+            Panel UI: `glinet-panel-ui` from `openwrt/packages`, LuCI panel app from `Beaverfffan/glinet-panel`
 
             Install `*-squashfs-sysupgrade.bin` from the stock firmware over SSH with
             `sysupgrade -n`. `*-squashfs-factory.bin` carries no OpenWrt metadata and
             both GL.iNet flashing paths reject it - see the README.
-            Later upgrades: flash the same sysupgrade image from LuCI, keeping settings.
+            Later upgrades: flash the same sysupgrade image from LuCI, keeping settings,
+            or let the router update itself (see "Automatic updates" in the README).
+            `sha256sums.sig` is an Ed25519 signature of `sha256sums`; `fingerprint.txt`
+            describes the image content the routers compare.
 
             Unofficial build. No warranty. Verify the recovery procedure before flashing.
           files: out/*
