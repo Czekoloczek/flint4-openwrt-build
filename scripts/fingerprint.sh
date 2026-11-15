@@ -23,6 +23,8 @@
 #
 # With a fifth argument the package list is also written there.
 set -euo pipefail
+# sort order must not depend on the machine's locale
+export LC_ALL=C
 
 img=$1 tree=$2 ci=$3 watched=$4 pkgout=${5:-}
 
