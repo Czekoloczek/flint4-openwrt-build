@@ -201,6 +201,16 @@ flashes the kept image back and skips that release from then on.
 `flint4-update run --busy --test-rollback` performs a real update that fails its health check on
 purpose, to watch the rollback work once.
 
+Release files come through the GitHub API (`releases/assets/<id>` with
+`Accept: application/octet-stream`), a handful of requests per check, well within the 60 an hour
+the API allows without a token. Not from `github.com/…/releases/download`: github.com answers
+that with a `Content-Security-Policy` header line over 4 KiB, and `uclient-fetch` reads the
+headers of an HTTPS reply into a single 4 KiB buffer, so it waits until the timeout. Images from
+2026-11-15 and the night after still do that and log `cannot download sha256sums`; flash a newer
+image by hand, or copy this repository's `files/usr/sbin/flint4-update` over the router's.
+[`scripts/test-flint4-update.sh`](scripts/test-flint4-update.sh) runs the updater against a
+fake GitHub that behaves this way, in every build before compiling.
+
 It cannot help with an image that does not boot far enough to run the check. The board has a
 single firmware slot, so that takes the U-Boot web recovery
 ([Going back to stock](#going-back-to-stock)) and then this build installed from the stock

@@ -256,6 +256,11 @@ jobs:
         with:
           path: ci
 
+      - name: Test flint4-update
+        # The self-updater against a fake GitHub; an image whose updater cannot
+        # update is stopped here, before hours of building.
+        run: ci/scripts/test-flint4-update.sh
+
       - name: Install build dependencies
         run: |
           sudo apt-get update

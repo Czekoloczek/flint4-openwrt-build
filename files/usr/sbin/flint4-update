@@ -63,12 +63,27 @@ fetch() {
 	uclient-fetch -q -T 60 -U "$UA" -O "$2" "$1" >/dev/null 2>&1
 }
 
-asset() {
-	echo "https://github.com/$FLINT4_REPO/releases/download/$1/$2"
+api() {
+	echo "https://api.github.com/repos/$FLINT4_REPO/$1"
+}
+
+# get <tag> <dir> <name> [out]: a file of the release, into <dir> unless <out>
+# is given. Through the API, never github.com/.../releases/download: github.com
+# answers that with a Content-Security-Policy header longer than 4 KiB, and
+# uclient-fetch reads the headers of an HTTPS reply into one 4 KiB buffer, so
+# it stalls until the timeout. The API redirects to the same file with short
+# headers. <dir>/release.json, the release as the API lists it, is fetched once.
+get() {
+	local id
+	[ -s "$2/release.json" ] || fetch "$(api "releases/tags/$1")" "$2/release.json" || return 1
+	id=$(jsonfilter -i "$2/release.json" -e "@.assets[@.name='$3'].id" 2>/dev/null)
+	[ -n "$id" ] || return 1
+	uclient-fetch -q -T 60 -U "$UA" --header 'Accept: application/octet-stream' \
+		-O "${4:-$2/$3}" "$(api "releases/assets/$id")" >/dev/null 2>&1
 }
 
 latest_tag() {
-	fetch "https://api.github.com/repos/$FLINT4_REPO/releases/latest" "$WORK/latest.json" || return 1
+	fetch "$(api releases/latest)" "$WORK/latest.json" || return 1
 	jsonfilter -i "$WORK/latest.json" -e '@.tag_name'
 }
 
@@ -88,7 +103,7 @@ meta() {
 	rm -rf "$2"
 	mkdir -p "$2"
 	for f in sha256sums sha256sums.sig fingerprint.txt; do
-		fetch "$(asset "$1" "$f")" "$2/$f" || { log "$1: cannot download $f"; return 1; }
+		get "$1" "$2" "$f" || { log "$1: cannot download $f"; return 1; }
 	done
 	if ! openssl pkeyutl -verify -pubin -inkey "$PUB" -rawin \
 			-in "$2/sha256sums" -sigfile "$2/sha256sums.sig" >/dev/null 2>&1; then
@@ -100,7 +115,7 @@ meta() {
 
 # image <tag> <metadir> <out>
 image() {
-	fetch "$(asset "$1" "$IMG")" "$3" || { log "$1: cannot download the image"; return 1; }
+	get "$1" "$2" "$IMG" "$3" || { log "$1: cannot download the image"; return 1; }
 	checksum "$2" "$IMG" "$3"
 }
 

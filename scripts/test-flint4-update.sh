@@ -19,12 +19,27 @@ openssl genpkey -algorithm ed25519 -out "$T/otherkey" 2>/dev/null
 mkdir -p "$T/bin"
 cat > "$T/bin/uclient-fetch" <<'E'
 #!/bin/bash
-out= url=
-while [ $# -gt 0 ]; do case "$1" in -O) out=$2; shift 2 ;; -q) shift ;; -T|-U) shift 2 ;; *) url=$1; shift ;; esac; done
-echo "$url" >> "$R/fetches"
+# GitHub as uclient-fetch sees it: github.com/.../releases/download never
+# answers in time (a header line over 4 KiB), the API lists a release with
+# asset ids and serves an asset's bytes only with Accept: application/octet-stream.
+out= url= raw=
+while [ $# -gt 0 ]; do case "$1" in -O) out=$2; shift 2 ;; -q) shift ;; -T|-U) shift 2 ;; --header) [ "$2" = "Accept: application/octet-stream" ] && raw=1; shift 2 ;; *) url=$1; shift ;; esac; done
+echo "$url${raw:+ [octet-stream]}" >> "$R/fetches"
+id() { printf %s "$1" | cksum | cut -d' ' -f1; }
 case "$url" in
 https://api.github.com/repos/*/releases/latest) src=$GH/latest.json ;;
-https://github.com/*/releases/download/*) rest=${url#*/releases/download/}; src=$GH/${rest%%/*}/${rest#*/} ;;
+https://api.github.com/repos/*/releases/tags/*)
+	tag=${url##*/}; [ -d "$GH/$tag" ] || exit 8
+	src=$R/api.json sep=
+	{ printf '{"tag_name": "%s", "assets": [' "$tag"
+	  for f in "$GH/$tag"/*; do printf '%s{"id": %s, "name": "%s"}' "$sep" "$(id "$tag/${f##*/}")" "${f##*/}"; sep=', '; done
+	  echo ']}'; } > "$src" ;;
+https://api.github.com/repos/*/releases/assets/*)
+	n=${url##*/} src=
+	for f in "$GH"/*/*; do [ "$(id "${f#"$GH"/}")" = "$n" ] && src=$f; done
+	[ -n "$src" ] || exit 8
+	[ -n "$raw" ] || { src=$R/api.json; echo "{\"id\": $n}" > "$src"; } ;;
+https://github.com/*/releases/download/*) exit 4 ;;
 https://api.github.com/|https://downloads.openwrt.org/) [ "${NET:-1}" = 1 ] || exit 4; src=/dev/null ;;
 *) exit 8 ;;
 esac
@@ -36,12 +51,15 @@ cat > "$T/bin/jsonfilter" <<'E'
 in=/dev/stdin expr=
 while [ $# -gt 0 ]; do case "$1" in -i) in=$2; shift 2 ;; -e) expr=$2; shift 2 ;; *) shift ;; esac; done
 python3 -I -c '
-import json,sys
-d=json.load(open(sys.argv[1]))
-k=sys.argv[2].split(".")[1]
-v=d.get(k)
+import json, re, sys
+d = json.load(open(sys.argv[1]))
+m = re.fullmatch(r"@\.assets\[@\.name=\x27(.*)\x27\]\.id", sys.argv[2])
+if m:
+    v = next((a["id"] for a in d.get("assets", []) if a.get("name") == m.group(1)), None)
+else:
+    v = d.get(sys.argv[2].split(".")[1])
 if v is None: sys.exit(1)
-print(str(v).lower() if isinstance(v,bool) else v)' "$in" "$expr"
+print(str(v).lower() if isinstance(v, bool) else v)' "$in" "$expr"
 E
 cat > "$T/bin/ifstatus" <<'E'
 #!/bin/bash
@@ -188,6 +206,9 @@ ok "running image not downloadable: refuses (no rollback)" 'logs "no image of th
 
 setup 18; release "$B" p2; latest "$B"; fu check
 ok "check: reports, changes nothing" 'grep -q "a run would now flash $B" $R/out && ! flashed && [ ! -e $R/state/pending ]'
+
+setup 19; release "$B" p2; latest "$B"; fu run --busy
+ok "downloads: release files only through the API, as octet-stream" 'flashed && ! grep -q "/releases/download/" $R/fetches && grep -q "/releases/assets/.* \[octet-stream\]" $R/fetches && ! grep "/releases/assets/" $R/fetches | grep -vq "\[octet-stream\]"'
 
 echo "---- $pass passed, $fail failed"
 [ "$fail" = 0 ]
